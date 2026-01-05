@@ -7,6 +7,7 @@ pub mod clubs;
 pub mod leadership;
 pub mod members;
 pub mod races;
+pub mod rallies;
 pub mod regions;
 pub mod roles;
 pub mod standing_committees;
