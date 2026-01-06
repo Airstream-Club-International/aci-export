@@ -20,8 +20,16 @@ pub type Future<'a, T> = futures::future::BoxFuture<'a, Result<T>>;
 pub type Stream<'a, T> = futures::stream::BoxStream<'a, Result<T>>;
 
 pub async fn connect(url: &str) -> Result<sqlx::MySqlPool> {
-    use sqlx::{Executor, MySqlPool};
-    let pool = MySqlPool::connect(url).await?;
+    use sqlx::{mysql::MySqlConnectOptions, ConnectOptions, Executor, MySqlPool};
+    use std::time::Duration;
+
+    // Parse URL and set slow query threshold to 10s (default is 1s)
+    // Bulk sync queries returning 100K+ rows legitimately take several seconds
+    let options: MySqlConnectOptions = url
+        .parse::<MySqlConnectOptions>()?
+        .log_slow_statements(log::LevelFilter::Warn, Duration::from_secs(10));
+
+    let pool = MySqlPool::connect_with(options).await?;
     let _ = pool
         .execute(
             r#"

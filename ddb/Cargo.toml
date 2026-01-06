@@ -23,3 +23,4 @@ clap = { workspace = true }
 dotenvy = { workspace = true }
 csv = "1"
 tokio = { workspace = true }
+log = "0.4"
