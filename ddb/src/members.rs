@@ -400,7 +400,7 @@ flags AS (
     a.uid,
     GREATEST(MAX(uhc.entity_id IS NOT NULL), MAX(uic.entity_id IS NOT NULL)) AS member_flag,
     MAX(uac.entity_id IS NOT NULL)                                          AS affiliate_flag,
-    MAX(DATE(a.join_dt_raw))                                                AS latest_join_date,
+    MIN(DATE(a.join_dt_raw))                                                AS earliest_join_date,
     MAX(DATE(a.leave_dt_raw))                                               AS latest_expiration_date
   FROM acp a
   LEFT JOIN user__field_home_club uhc
@@ -458,7 +458,7 @@ SELECT
   END                                          AS member_type,
   COALESCE(ttd.name, 'Regular')                AS member_class,
   md.personal_status_id                        AS member_status,
-  flags.latest_join_date                       AS join_date,
+  flags.earliest_join_date                     AS join_date,
   flags.latest_expiration_date                 AS expiration_date,
 
   /* ===================== CLUB FIELDS ===================== */
