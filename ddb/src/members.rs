@@ -360,7 +360,47 @@ fn fetch_members_query<'builder>() -> sqlx::QueryBuilder<'builder, MySql> {
 */
 
 const FETCH_CLUB_MEMBERS_QUERY: &str = r#"
-WITH acp AS (
+WITH club_scope AS (
+  /* branch 1: single club */
+  SELECT club_nid
+  FROM (SELECT ? AS club_nid) AS one
+  WHERE ? IS NOT NULL
+  UNION ALL
+  /* branch 2: all clubs in a region */
+  SELECT nr.entity_id AS club_nid
+  FROM node__field_region nr
+  WHERE nr.deleted = '0'
+    AND nr.field_region_target_id = ?
+),
+
+all_club_memberships AS (
+  /* All memberships (including historical) for users in scoped clubs */
+  SELECT
+    p.parent_id AS uid,
+    pc.field_club_target_id AS club_nid,
+    fjd.field_join_date_value AS join_dt_raw
+  FROM paragraphs_item_field_data p
+  JOIN paragraph__field_club pc
+    ON pc.entity_id = p.id
+   AND pc.deleted = '0'
+  LEFT JOIN paragraph__field_join_date fjd
+    ON fjd.entity_id = p.id AND fjd.deleted = '0'
+  WHERE p.status = '1'
+    AND p.type = 'membership'
+    AND pc.field_club_target_id IN (SELECT club_nid FROM club_scope)
+    AND fjd.field_join_date_value IS NOT NULL
+    AND DATE(fjd.field_join_date_value) <= CURRENT_DATE
+),
+
+earliest_join AS (
+  /* Earliest join date across ALL memberships (including historical) per user */
+  SELECT uid, MIN(DATE(join_dt_raw)) AS earliest_join_date
+  FROM all_club_memberships
+  GROUP BY uid
+),
+
+acp AS (
+  /* Currently active memberships only */
   SELECT
     p.parent_id AS uid,
     p.id        AS paragraph_id,
@@ -377,19 +417,7 @@ WITH acp AS (
     ON fld.entity_id = p.id AND fld.deleted = '0'
   WHERE p.status = '1'
     AND p.type   = 'membership'
-    /* ---------- club or region scope (parameterized) ---------- */
-    AND pc.field_club_target_id IN (
-          /* branch 1: single club */
-          SELECT club_nid
-          FROM (SELECT ? AS club_nid) AS one
-          WHERE ? IS NOT NULL
-          UNION ALL
-          /* branch 2: all clubs in a region */
-          SELECT nr.entity_id AS club_nid
-          FROM node__field_region nr
-          WHERE nr.deleted = '0'
-            AND nr.field_region_target_id = ?
-        )
+    AND pc.field_club_target_id IN (SELECT club_nid FROM club_scope)
     AND fjd.field_join_date_value IS NOT NULL
     AND DATE(fjd.field_join_date_value) <= CURRENT_DATE
     AND (fld.field_leave_date_value IS NULL OR DATE(fld.field_leave_date_value) >= CURRENT_DATE)
@@ -400,7 +428,6 @@ flags AS (
     a.uid,
     GREATEST(MAX(uhc.entity_id IS NOT NULL), MAX(uic.entity_id IS NOT NULL)) AS member_flag,
     MAX(uac.entity_id IS NOT NULL)                                          AS affiliate_flag,
-    MIN(DATE(a.join_dt_raw))                                                AS earliest_join_date,
     MAX(DATE(a.leave_dt_raw))                                               AS latest_expiration_date
   FROM acp a
   LEFT JOIN user__field_home_club uhc
@@ -458,7 +485,7 @@ SELECT
   END                                          AS member_type,
   COALESCE(ttd.name, 'Regular')                AS member_class,
   md.personal_status_id                        AS member_status,
-  flags.earliest_join_date                     AS join_date,
+  earliest_join.earliest_join_date             AS join_date,
   flags.latest_expiration_date                 AS expiration_date,
 
   /* ===================== CLUB FIELDS ===================== */
@@ -478,6 +505,8 @@ SELECT
   CAST(md.partner_birthdate AS DATE)           AS partner_birthday
 
 FROM flags
+JOIN earliest_join
+  ON earliest_join.uid = flags.uid
 JOIN users_field_data u
   ON u.uid = flags.uid
 JOIN z_member_search_main md

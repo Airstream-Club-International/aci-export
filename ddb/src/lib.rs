@@ -20,7 +20,7 @@ pub type Future<'a, T> = futures::future::BoxFuture<'a, Result<T>>;
 pub type Stream<'a, T> = futures::stream::BoxStream<'a, Result<T>>;
 
 pub async fn connect(url: &str) -> Result<sqlx::MySqlPool> {
-    use sqlx::{mysql::MySqlConnectOptions, ConnectOptions, Executor, MySqlPool};
+    use sqlx::{ConnectOptions, Executor, MySqlPool, mysql::MySqlConnectOptions};
     use std::time::Duration;
 
     // Parse URL and set slow query threshold to 10s (default is 1s)
