@@ -21,6 +21,7 @@ pub async fn connect_from_env() -> Result<MySqlPool> {
 pub mod clubs;
 pub mod international;
 pub mod members;
+pub mod microsites;
 pub mod regions;
 pub mod standing_committees;
 pub mod users;
@@ -50,6 +51,7 @@ pub enum DdbCommand {
     Regions(regions::Cmd),
     StandingCommittees(standing_committees::Cmd),
     International(international::Cmd),
+    Microsites(microsites::Cmd),
 }
 
 impl DdbCommand {
@@ -61,6 +63,7 @@ impl DdbCommand {
             Self::Regions(cmd) => cmd.run().await,
             Self::StandingCommittees(cmd) => cmd.run().await,
             Self::International(cmd) => cmd.run().await,
+            Self::Microsites(cmd) => cmd.run().await,
         }
     }
 }

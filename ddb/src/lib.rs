@@ -6,6 +6,7 @@ pub mod airstreams;
 pub mod clubs;
 pub mod leadership;
 pub mod members;
+pub mod microsites;
 pub mod races;
 pub mod rallies;
 pub mod regions;
