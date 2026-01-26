@@ -129,6 +129,40 @@ pub async fn all(pool: &MySqlPool) -> Result<Vec<User>> {
         .await
 }
 
+/// User avatar from Drupal file_managed table.
+#[derive(Debug, sqlx::FromRow)]
+pub struct UserAvatar {
+    /// Drupal user ID
+    pub uid: u64,
+    /// File URI (e.g., "public://pictures/2020-02/Marc164.png")
+    pub uri: String,
+}
+
+/// Fetch all users with custom avatars (excluding default images).
+pub async fn avatars(pool: &MySqlPool) -> Result<Vec<UserAvatar>> {
+    let avatars = sqlx::query_as::<_, UserAvatar>(
+        r#"
+        SELECT u.uid, f.uri
+        FROM users_field_data u
+        JOIN user__user_picture p ON u.uid = p.entity_id
+        JOIN file_managed f ON p.user_picture_target_id = f.fid
+        WHERE f.uri NOT LIKE '%default%'
+          AND f.uri LIKE 'public://%'
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(avatars)
+}
+
+/// Convert Drupal file URI to downloadable path.
+/// e.g., "public://pictures/2020-02/Marc164.png" -> "/sites/default/files/pictures/2020-02/Marc164.png"
+pub fn avatar_uri_to_path(uri: &str) -> Option<String> {
+    uri.strip_prefix("public://")
+        .map(|path| format!("/sites/default/files/{path}"))
+}
+
 pub mod db {
     use super::*;
     use ::db as app_db;
