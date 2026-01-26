@@ -142,7 +142,7 @@ pub struct UserAvatar {
 pub async fn avatars(pool: &MySqlPool) -> Result<Vec<UserAvatar>> {
     let avatars = sqlx::query_as::<_, UserAvatar>(
         r#"
-        SELECT u.uid, f.uri
+        SELECT u.uid, CAST(f.uri AS CHAR) AS uri
         FROM users_field_data u
         JOIN user__user_picture p ON u.uid = p.entity_id
         JOIN file_managed f ON p.user_picture_target_id = f.fid
