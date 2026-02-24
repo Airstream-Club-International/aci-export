@@ -1,6 +1,6 @@
 //! Microsite sync commands.
 
-use super::{connect_from_env, print_json, Result};
+use super::{Result, connect_from_env, print_json};
 use aci_ddb::microsites::{self, ClubMicrosite, MicrositePage};
 
 #[derive(Debug, clap::Args)]
@@ -98,7 +98,8 @@ impl PagesCmd {
         };
 
         // Fetch pages
-        let pages: Vec<MicrositePage> = microsites::pages_for_club(&pool, club.homepage_nid).await?;
+        let pages: Vec<MicrositePage> =
+            microsites::pages_for_club(&pool, club.homepage_nid).await?;
 
         #[derive(serde::Serialize)]
         struct PageInfo {
