@@ -4,7 +4,7 @@
 //! microsite join (event → field_club → main_site_club → ssp_club/ssp_region).
 
 use crate::{Error, Result};
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use futures::TryFutureExt;
 use sqlx::MySqlPool;
 
@@ -27,6 +27,14 @@ pub struct Event {
     pub phone: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub website_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_deadline: Option<NaiveDate>,
     /// nid of the owning ssp_club or ssp_region node
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_uid: Option<u64>,
@@ -49,6 +57,10 @@ const FETCH_EVENTS_QUERY: &str = r#"
         addr.field_event_address_value AS address,
         ph.field_event_phone_value AS phone,
         web.field_event_website_uri AS website_url,
+        body.body_value AS body,
+        rl.field_registration_link_uri AS registration_url,
+        rl.field_registration_link_title AS registration_label,
+        CAST(rdd.field_registration_deadline_value AS DATE) AS registration_deadline,
         msc.entity_id AS owner_uid,
         owner_nd.type AS owner_node_type,
         e.status,
@@ -61,6 +73,9 @@ const FETCH_EVENTS_QUERY: &str = r#"
     LEFT JOIN node__field_event_address addr ON e.nid = addr.entity_id AND addr.deleted = 0
     LEFT JOIN node__field_event_phone ph ON e.nid = ph.entity_id AND ph.deleted = 0
     LEFT JOIN node__field_event_website web ON e.nid = web.entity_id AND web.deleted = 0
+    LEFT JOIN node__body body ON e.nid = body.entity_id AND body.deleted = 0
+    LEFT JOIN node__field_registration_link rl ON e.nid = rl.entity_id AND rl.deleted = 0
+    LEFT JOIN node__field_registration_deadline rdd ON e.nid = rdd.entity_id AND rdd.deleted = 0
     LEFT JOIN node__field_club fc ON e.nid = fc.entity_id AND fc.deleted = 0
     LEFT JOIN node__field_main_site_club msc
         ON fc.field_club_target_id = msc.field_main_site_club_target_id AND msc.deleted = 0
