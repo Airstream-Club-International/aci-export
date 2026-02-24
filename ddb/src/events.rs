@@ -41,6 +41,10 @@ pub struct Event {
     pub contact_email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contact_phone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f64>,
     /// nid of the owning ssp_club or ssp_region node
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_uid: Option<u64>,
@@ -70,6 +74,8 @@ const FETCH_EVENTS_QUERY: &str = r#"
         cn.field_contact_name_value AS contact_name,
         ce.field_contact_email_value AS contact_email,
         cp.field_contact_phone_value AS contact_phone,
+        CAST(lat.field_latitude_value AS DECIMAL(10,7)) AS latitude,
+        CAST(lon.field_longitude_value AS DECIMAL(10,7)) AS longitude,
         msc.entity_id AS owner_uid,
         owner_nd.type AS owner_node_type,
         e.status,
@@ -88,6 +94,9 @@ const FETCH_EVENTS_QUERY: &str = r#"
     LEFT JOIN node__field_contact_name cn ON e.nid = cn.entity_id AND cn.deleted = 0
     LEFT JOIN node__field_contact_email ce ON e.nid = ce.entity_id AND ce.deleted = 0
     LEFT JOIN node__field_contact_phone cp ON e.nid = cp.entity_id AND cp.deleted = 0
+    LEFT JOIN node__field_coordinates coord ON e.nid = coord.entity_id AND coord.deleted = 0
+    LEFT JOIN paragraph__field_latitude lat ON coord.field_coordinates_target_id = lat.entity_id AND lat.deleted = 0
+    LEFT JOIN paragraph__field_longitude lon ON coord.field_coordinates_target_id = lon.entity_id AND lon.deleted = 0
     LEFT JOIN node__field_club fc ON e.nid = fc.entity_id AND fc.deleted = 0
     LEFT JOIN node__field_main_site_club msc
         ON fc.field_club_target_id = msc.field_main_site_club_target_id AND msc.deleted = 0
