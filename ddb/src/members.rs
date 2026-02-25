@@ -146,11 +146,13 @@ WITH all_international AS (
     SELECT
         p.id AS paragraph_id,
         CAST(p.parent_id AS UNSIGNED) AS user_uid,
-        CAST(md.partner_user_id AS UNSIGNED) AS partner_uid,
+        CAST(CASE WHEN pu.uid IS NOT NULL THEN md.partner_user_id END AS UNSIGNED) AS partner_uid,
         COALESCE(ttd.name, 'Regular') AS member_class,
         DATE(fjd.field_join_date_value) AS join_date,
         DATE(fld.field_leave_date_value) AS leave_date
     FROM paragraphs_item_field_data p
+    INNER JOIN users_field_data u
+        ON u.uid = p.parent_id
     INNER JOIN paragraph__field_join_date fjd
         ON fjd.entity_id = p.id
         AND fjd.deleted = '0'
@@ -164,6 +166,8 @@ WITH all_international AS (
         ON ttd.tid = mc.field_membership_class_target_id
     LEFT JOIN z_member_search_main md
         ON md.user_id = p.parent_id
+    LEFT JOIN users_field_data pu
+        ON pu.uid = md.partner_user_id
     WHERE p.status = '1'
         AND p.type = 'ssp_international_membership'
         AND fjd.field_join_date_value IS NOT NULL
@@ -195,7 +199,7 @@ WITH all_memberships AS (
     SELECT
         p.id AS paragraph_id,
         CAST(p.parent_id AS UNSIGNED) AS user_uid,
-        CAST(md.partner_user_id AS UNSIGNED) AS partner_uid,
+        CAST(CASE WHEN pu.uid IS NOT NULL THEN md.partner_user_id END AS UNSIGNED) AS partner_uid,
         pc.field_club_target_id AS club_uid,
         COALESCE(ttd.name, 'Regular') AS member_class,
         CASE
@@ -207,6 +211,8 @@ WITH all_memberships AS (
         DATE(fjd.field_join_date_value) AS join_date,
         DATE(fld.field_leave_date_value) AS leave_date
     FROM paragraphs_item_field_data p
+    INNER JOIN users_field_data u
+        ON u.uid = p.parent_id
     INNER JOIN paragraph__field_club pc
         ON pc.entity_id = p.id
         AND pc.deleted = '0'
@@ -232,6 +238,8 @@ WITH all_memberships AS (
         AND uic.deleted = '0'
     LEFT JOIN z_member_search_main md
         ON md.user_id = p.parent_id
+    LEFT JOIN users_field_data pu
+        ON pu.uid = md.partner_user_id
     WHERE p.status = '1'
         AND p.type = 'membership'
         AND fjd.field_join_date_value IS NOT NULL
