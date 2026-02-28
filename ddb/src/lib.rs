@@ -3,6 +3,7 @@ pub use error::{Error, Result};
 
 pub mod addresses;
 pub mod airstreams;
+pub mod brns;
 pub mod clubs;
 pub mod events;
 pub mod leadership;
