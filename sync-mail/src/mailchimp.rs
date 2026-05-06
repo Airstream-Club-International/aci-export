@@ -290,10 +290,7 @@ impl Job {
     async fn prepare_mc_members(
         &self,
         db: &MySqlPool,
-    ) -> Result<(
-        Vec<ddb::members::Member>,
-        Vec<mailchimp::members::Member>,
-    )> {
+    ) -> Result<(Vec<ddb::members::Member>, Vec<mailchimp::members::Member>)> {
         let db_members = self.db_members(db).await?;
         let merge_fields = self.merge_fields()?;
         let db_addresses =
@@ -363,14 +360,11 @@ impl Job {
 
         // Drupal prep and the MailChimp audience fetch are independent — run
         // them in parallel so the audience round-trips overlap with the db work.
-        let (prep, audience) = tokio::try_join!(
-            self.prepare_mc_members(&db),
-            async {
-                mailchimp::members::all_collect(&client, &self.list, audience_query)
-                    .await
-                    .map_err(anyhow::Error::from)
-            },
-        )?;
+        let (prep, audience) = tokio::try_join!(self.prepare_mc_members(&db), async {
+            mailchimp::members::all_collect(&client, &self.list, audience_query)
+                .await
+                .map_err(anyhow::Error::from)
+        },)?;
         let (_db_members, mc_members) = prep;
 
         // Mirror what upsert_many would produce: the hash of each emitted email.
