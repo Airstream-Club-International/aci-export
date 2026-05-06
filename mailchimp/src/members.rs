@@ -1,6 +1,6 @@
 use crate::{
-    Client, DEFAULT_QUERY_COUNT, Error, NO_QUERY, Result, RetryPolicy, Stream, batches,
-    deserialize_null_string, lists, paged_query_impl, paged_response_impl, query_default_impl,
+    Client, Error, NO_QUERY, Result, RetryPolicy, Stream, batches, deserialize_null_string,
+    paged_query_impl, paged_response_impl, query_default_impl,
 };
 use futures::{
     TryFutureExt,
@@ -32,27 +32,45 @@ pub fn all(client: &Client, list_id: &str, query: MembersQuery) -> Stream<Member
 pub async fn all_collect(
     client: &Client,
     list_id: &str,
-    query: MembersQuery,
+    mut query: MembersQuery,
 ) -> Result<Vec<Member>> {
-    let list_info = lists::get(client, list_id).await?;
-    let total = list_info
-        .stats
-        .and_then(|stats| stats.total_contacts)
-        .unwrap();
-    stream::iter(0..total)
-        .chunks(DEFAULT_QUERY_COUNT)
-        .map(|chunk| {
+    // Need total_items in the response to parallelize page fetches; if the caller
+    // restricted fields to e.g. "members.id" we must add total_items so the
+    // response carries the count.
+    if !query.fields.is_empty() && !query.fields.split(',').any(|f| f.trim() == "total_items") {
+        query.fields = format!("{},total_items", query.fields);
+    }
+
+    let path = format!("/3.0/lists/{list_id}/members");
+    let mut first = query.clone();
+    first.offset = 0;
+    let first_page: MembersResponse = client.fetch(&path, &first).await?;
+    let total = first_page.total_items as usize;
+    let page_size = query.count.max(1);
+
+    let mut all_members = first_page.members;
+    if total <= page_size {
+        return Ok(all_members);
+    }
+
+    let remaining: Vec<Vec<Member>> = stream::iter((page_size..total).step_by(page_size))
+        .map(|offset| {
             let mut page = query.clone();
-            page.offset = chunk[0] as usize;
-            page.count = chunk.len();
-            client
-                .fetch::<MembersResponse, _>(&format!("/3.0/lists/{list_id}/members"), &page)
-                .map_ok(|response| response.members)
+            page.offset = offset;
+            let path = path.clone();
+            let client = client.clone();
+            async move {
+                client
+                    .fetch::<MembersResponse, _>(&path, &page)
+                    .map_ok(|response| response.members)
+                    .await
+            }
         })
         .buffered(10)
-        .try_collect::<Vec<Vec<_>>>()
-        .map_ok(|coll| coll.into_iter().flatten().collect())
-        .await
+        .try_collect()
+        .await?;
+    all_members.extend(remaining.into_iter().flatten());
+    Ok(all_members)
 }
 
 pub async fn get(client: &Client, list_id: &str, member_id: &str) -> Result<Member> {
@@ -378,6 +396,8 @@ pub struct MembersQuery {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MembersResponse {
     pub members: Vec<Member>,
+    #[serde(default)]
+    pub total_items: u64,
 }
 
 query_default_impl!(MembersQuery);
