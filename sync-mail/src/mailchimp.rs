@@ -283,25 +283,37 @@ impl Job {
             .collect()
     }
 
-    #[tracing::instrument(skip_all, name = "sync", fields(name = self.name, id = self.id))]
-    pub async fn sync(&self, ddb_url: AciDatabaseSettings) -> Result<(usize, usize)> {
-        let db = ddb_url.connect().await?;
-        let db_members = self.db_members(&db).await?;
+    /// Load Drupal members for this job and convert them into the MailChimp
+    /// member shape (with mailing addresses injected). Returned tuple is
+    /// `(db_members, mc_members)` because callers typically need both:
+    /// `mc_members` for upsert/hash computation, `db_members` for tag updates.
+    async fn prepare_mc_members(
+        &self,
+        db: &MySqlPool,
+    ) -> Result<(
+        Vec<ddb::members::Member>,
+        Vec<mailchimp::members::Member>,
+    )> {
+        let db_members = self.db_members(db).await?;
         let merge_fields = self.merge_fields()?;
-        tracing::info!("starting sync");
-        // Fetch addresses for primary members
-        tracing::debug!("querying ddb");
-        let start = Instant::now();
         let db_addresses =
-            ddb::members::mailing_address::for_members(&db, db_members.iter()).await?;
-
-        // Convert ddb members to mailchimp members while injecting address
+            ddb::members::mailing_address::for_members(db, db_members.iter()).await?;
         let mc_members = ddb::members::mailchimp::to_members_with_address(
             &db_members,
             &db_addresses,
             &merge_fields,
         )
         .await?;
+        Ok((db_members, mc_members))
+    }
+
+    #[tracing::instrument(skip_all, name = "sync", fields(name = self.name, id = self.id))]
+    pub async fn sync(&self, ddb_url: AciDatabaseSettings) -> Result<(usize, usize)> {
+        let db = ddb_url.connect().await?;
+        tracing::info!("starting sync");
+        let start = Instant::now();
+        tracing::debug!("querying ddb");
+        let (db_members, mc_members) = self.prepare_mc_members(&db).await?;
 
         tracing::debug!("upserting members");
         let client = self.client()?;
@@ -343,16 +355,23 @@ impl Job {
     #[tracing::instrument(skip_all, name = "dry_run", fields(name = self.name, id = self.id))]
     pub async fn dry_run(&self, ddb_url: AciDatabaseSettings) -> Result<DryRunResult> {
         let db = ddb_url.connect().await?;
-        let db_members = self.db_members(&db).await?;
-        let merge_fields = self.merge_fields()?;
-        let db_addresses =
-            ddb::members::mailing_address::for_members(&db, db_members.iter()).await?;
-        let mc_members = ddb::members::mailchimp::to_members_with_address(
-            &db_members,
-            &db_addresses,
-            &merge_fields,
-        )
-        .await?;
+        let client = self.client()?;
+        let audience_query = MembersQuery {
+            fields: "members.id,members.email_address,members.status".to_string(),
+            ..Default::default()
+        };
+
+        // Drupal prep and the MailChimp audience fetch are independent — run
+        // them in parallel so the audience round-trips overlap with the db work.
+        let (prep, audience) = tokio::try_join!(
+            self.prepare_mc_members(&db),
+            async {
+                mailchimp::members::all_collect(&client, &self.list, audience_query)
+                    .await
+                    .map_err(anyhow::Error::from)
+            },
+        )?;
+        let (_db_members, mc_members) = prep;
 
         // Mirror what upsert_many would produce: the hash of each emitted email.
         // (to_members already filters via is_valid_email at the source.)
@@ -360,17 +379,6 @@ impl Job {
             .iter()
             .map(|m| member_id(&m.email_address))
             .collect();
-
-        let client = self.client()?;
-        let audience = mailchimp::members::all_collect(
-            &client,
-            &self.list,
-            MembersQuery {
-                fields: "members.id,members.email_address,members.status".to_string(),
-                ..Default::default()
-            },
-        )
-        .await?;
 
         let would_delete: Vec<DryRunEntry> = audience
             .into_iter()
