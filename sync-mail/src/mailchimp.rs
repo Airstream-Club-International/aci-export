@@ -1,15 +1,32 @@
 use crate::{Error, Result, settings::AciDatabaseSettings};
 use chrono::{DateTime, Utc};
 use futures::TryFutureExt;
-use mailchimp::RetryPolicy;
+use mailchimp::{
+    RetryPolicy,
+    members::{MembersQuery, member_id},
+};
 use sqlx::{Database, Encode, MySqlPool, PgPool, Type, query::QueryAs};
-use std::time::Instant;
+use std::{collections::HashSet, time::Instant};
 
 #[derive(Debug, serde::Serialize)]
 pub struct JobSyncResult {
     pub name: String,
     pub deleted: usize,
     pub upserted: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct DryRunResult {
+    pub name: String,
+    pub upserted: usize,
+    pub would_delete: Vec<DryRunEntry>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct DryRunEntry {
+    pub id: String,
+    pub email_address: String,
+    pub status: Option<mailchimp::members::MemberStatus>,
 }
 
 #[derive(Debug, sqlx::FromRow, Clone, serde::Serialize, Default)]
@@ -287,5 +304,58 @@ impl Job {
         );
 
         Ok((deleted, upserted.len()))
+    }
+
+    /// Compute what `sync()` would delete from MailChimp, without actually deleting
+    /// (and without upserting). Useful for verifying the retain() set before running
+    /// destructive changes.
+    #[tracing::instrument(skip_all, name = "dry_run", fields(name = self.name, id = self.id))]
+    pub async fn dry_run(&self, ddb_url: AciDatabaseSettings) -> Result<DryRunResult> {
+        let db = ddb_url.connect().await?;
+        let db_members = self.db_members(&db).await?;
+        let merge_fields = self.merge_fields()?;
+        let db_addresses =
+            ddb::members::mailing_address::for_members(&db, db_members.iter()).await?;
+        let mc_members = ddb::members::mailchimp::to_members_with_address(
+            &db_members,
+            &db_addresses,
+            &merge_fields,
+        )
+        .await?;
+
+        // Mirror what upsert_many would produce: the hash of each emitted email.
+        // (to_members already filters via is_valid_email at the source.)
+        let upserted: HashSet<String> = mc_members
+            .iter()
+            .map(|m| member_id(&m.email_address))
+            .collect();
+
+        let client = self.client()?;
+        let audience = mailchimp::members::all_collect(
+            &client,
+            &self.list,
+            MembersQuery {
+                fields: "members.id,members.email_address,members.status".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let would_delete: Vec<DryRunEntry> = audience
+            .into_iter()
+            .filter(|m| m.status != Some(mailchimp::members::MemberStatus::Cleaned))
+            .filter(|m| !upserted.contains(&m.id))
+            .map(|m| DryRunEntry {
+                id: m.id,
+                email_address: m.email_address,
+                status: m.status,
+            })
+            .collect();
+
+        Ok(DryRunResult {
+            name: self.name.clone(),
+            upserted: upserted.len(),
+            would_delete,
+        })
     }
 }

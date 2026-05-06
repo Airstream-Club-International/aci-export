@@ -5,6 +5,9 @@ use crate::{Result, cmd::print_json, mailchimp::Job, settings::Settings};
 pub struct Cmd {
     /// The id of the mailing list to sync
     id: Option<u64>,
+    /// Compute what would be archived without making any changes in MailChimp
+    #[arg(long)]
+    dry_run: bool,
 }
 
 impl Cmd {
@@ -18,6 +21,21 @@ impl Cmd {
         } else {
             Job::all(&db).await?
         };
+
+        if self.dry_run {
+            let mut results = Vec::with_capacity(jobs.len());
+            for job in jobs {
+                let id = job.id;
+                let name = job.name.clone();
+                match job.dry_run(settings.ddb.clone()).await {
+                    Ok(result) => results.push((id, result)),
+                    Err(e) => {
+                        tracing::error!(job_id = id, job_name = name, "dry-run failed: {e}");
+                    }
+                }
+            }
+            return print_json(&results);
+        }
 
         let map = Job::sync_many(jobs, settings.ddb).await;
         print_json(&map)
