@@ -252,6 +252,37 @@ impl Job {
             .collect()
     }
 
+    /// Run dry_run for multiple jobs in parallel, returning results keyed by job ID
+    /// Jobs that fail are logged but don't stop other jobs from running
+    pub async fn dry_run_many(
+        jobs: Vec<Self>,
+        ddb_settings: AciDatabaseSettings,
+    ) -> std::collections::HashMap<i64, DryRunResult> {
+        use futures::StreamExt;
+
+        futures::stream::iter(jobs)
+            .map(|job| {
+                let ddb_settings = ddb_settings.clone();
+                async move {
+                    let name = job.name.clone();
+                    let id = job.id;
+                    match job.dry_run(ddb_settings).await {
+                        Ok(result) => Some((id, result)),
+                        Err(e) => {
+                            tracing::error!(job_id = id, job_name = name, "dry-run failed: {e}");
+                            None
+                        }
+                    }
+                }
+            })
+            .buffered(20)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     #[tracing::instrument(skip_all, name = "sync", fields(name = self.name, id = self.id))]
     pub async fn sync(&self, ddb_url: AciDatabaseSettings) -> Result<(usize, usize)> {
         let db = ddb_url.connect().await?;

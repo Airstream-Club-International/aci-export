@@ -34,9 +34,8 @@ pub async fn all_collect(
     list_id: &str,
     mut query: MembersQuery,
 ) -> Result<Vec<Member>> {
-    // Need total_items in the response to parallelize page fetches; if the caller
-    // restricted fields to e.g. "members.id" we must add total_items so the
-    // response carries the count.
+    // If the caller restricted fields, ensure total_items is included so we can
+    // bound the parallel page dispatch.
     if !query.fields.is_empty() && !query.fields.split(',').any(|f| f.trim() == "total_items") {
         query.fields = format!("{},total_items", query.fields);
     }

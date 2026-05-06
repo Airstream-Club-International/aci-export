@@ -23,18 +23,8 @@ impl Cmd {
         };
 
         if self.dry_run {
-            let mut results = Vec::with_capacity(jobs.len());
-            for job in jobs {
-                let id = job.id;
-                let name = job.name.clone();
-                match job.dry_run(settings.ddb.clone()).await {
-                    Ok(result) => results.push((id, result)),
-                    Err(e) => {
-                        tracing::error!(job_id = id, job_name = name, "dry-run failed: {e}");
-                    }
-                }
-            }
-            return print_json(&results);
+            let map = Job::dry_run_many(jobs, settings.ddb).await;
+            return print_json(&map);
         }
 
         let map = Job::sync_many(jobs, settings.ddb).await;
