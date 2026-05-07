@@ -31,6 +31,18 @@ pub async fn by_number(pool: &MySqlPool, number: i32) -> Result<Option<Club>> {
     Ok(club)
 }
 
+pub async fn search_by_name(pool: &MySqlPool, pattern: &str) -> Result<Vec<Club>> {
+    let like = format!("%{pattern}%");
+    fetch_clubs_query()
+        .push(" AND LOWER(nd.title) LIKE LOWER(")
+        .push_bind(like)
+        .push(")")
+        .build_query_as::<Club>()
+        .fetch_all(pool)
+        .map_err(Error::from)
+        .await
+}
+
 const FETCH_CLUBS_QUERY: &str = r#"
         SELECT
             nd.nid as uid,
