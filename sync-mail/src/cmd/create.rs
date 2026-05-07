@@ -78,9 +78,8 @@ impl Cmd {
                         let candidates = matches
                             .iter()
                             .map(|c| {
-                                let number = c
-                                    .number
-                                    .map_or_else(|| "-".to_string(), |n| n.to_string());
+                                let number =
+                                    c.number.map_or_else(|| "-".to_string(), |n| n.to_string());
                                 let inactive = if c.active { "" } else { " [inactive]" };
                                 format!("  {number:>5} (uid {}) {}{inactive}", c.uid, c.name)
                             })
