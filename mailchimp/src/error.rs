@@ -23,6 +23,12 @@ pub enum Error {
     InvalidMergeField(String),
     #[error("config: {0}")]
     Config(#[from] config::ConfigError),
+    #[error("batch {batch_id} had {errored} of {total} operations fail")]
+    BatchPartialFailure {
+        batch_id: String,
+        errored: u16,
+        total: u16,
+    },
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]

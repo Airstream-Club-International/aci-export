@@ -356,12 +356,19 @@ pub mod tags {
                     let operation = batch::update(&mut batch, list_id, member_id, updates)?;
                     operation.operation_id = member_id.to_owned();
                 }
-                Retry::spawn_notify(
+                let info = Retry::spawn_notify(
                     retries,
                     || batch.run(&client, true).map_err(Error::into_retry),
                     log_batch_tag_retry,
                 )
                 .await?;
+                if info.errored_operations > 0 {
+                    return Err(Error::BatchPartialFailure {
+                        batch_id: info.id,
+                        errored: info.errored_operations,
+                        total: info.total_operations,
+                    });
+                }
                 Ok(())
             })
             .await
