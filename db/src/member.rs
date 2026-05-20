@@ -88,6 +88,7 @@ const FETCH_MEMBERS_QUERY: &str = r#"
 
         member.member_class,
         member.member_type,
+        member.member_status,
         member.expiration_date,
         member.join_date,
 
@@ -124,6 +125,7 @@ pub async fn upsert_many(pool: &PgPool, members: &[Member]) -> Result<u64> {
                     partner_user,
                     member_class,
                     member_type,
+                    member_status,
                     expiration_date,
                     join_date,
                     local_club
@@ -134,6 +136,7 @@ pub async fn upsert_many(pool: &PgPool, members: &[Member]) -> Result<u64> {
                     .push_bind(member.partner.as_ref().map(|user| &user.id))
                     .push_bind(&member.member_class)
                     .push_bind(&member.member_type)
+                    .push_bind(&member.member_status)
                     .push_bind(member.expiration_date)
                     .push_bind(member.join_date)
                     .push_bind(member.local_club.number);
@@ -143,6 +146,7 @@ pub async fn upsert_many(pool: &PgPool, members: &[Member]) -> Result<u64> {
                 partner_user = excluded.partner_user,
                 member_class = excluded.member_class,
                 member_type = excluded.member_type,
+                member_status = excluded.member_status,
                 expiration_date = excluded.expiration_date,
                 join_date = excluded.join_date,
                 local_club = excluded.local_club
@@ -260,8 +264,9 @@ impl TryFrom<String> for MemberClass {
     }
 }
 
-#[derive(Debug, serde::Serialize, Default, PartialEq, Eq)]
+#[derive(Debug, serde::Serialize, Default, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
+#[sqlx(type_name = "member_status", rename_all = "lowercase")]
 pub enum MemberStatus {
     #[default]
     Current,
@@ -283,19 +288,6 @@ impl TryFrom<String> for MemberStatus {
         match value.to_lowercase().as_str() {
             "current" => Ok(Self::Current),
             "lapsed" => Ok(Self::Lapsed),
-            other => Err(sqlx::Error::decode(format!(
-                "unexpected member status {other}"
-            ))),
-        }
-    }
-}
-
-impl TryFrom<i32> for MemberStatus {
-    type Error = sqlx::Error;
-    fn try_from(value: i32) -> std::result::Result<Self, Self::Error> {
-        match value {
-            947 | 1099 => Ok(Self::Current),
-            951 => Ok(Self::Lapsed),
             other => Err(sqlx::Error::decode(format!(
                 "unexpected member status {other}"
             ))),
@@ -340,7 +332,7 @@ pub struct Member {
     pub member_class: MemberClass,
     #[sqlx(default, try_from = "String")]
     pub member_type: MemberType,
-    #[sqlx(default, try_from = "i32")]
+    #[sqlx(default, try_from = "String")]
     pub member_status: MemberStatus,
     #[sqlx(flatten)]
     pub primary: user::User,
