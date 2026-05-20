@@ -1,5 +1,5 @@
 use crate::{
-    Result,
+    Context, Result,
     settings::{AciDatabaseSettings, AppSettings},
 };
 use db::{address, brn, club, leadership, member, region, standing_committee, user};
@@ -468,6 +468,11 @@ pub async fn run(
 ) -> Result<SyncStatsMap> {
     let ddb = ddb_settings.connect().await?;
     let db = app_settings.db.connect().await?;
+
+    sqlx::migrate!()
+        .run(&db)
+        .await
+        .context("running migrations")?;
 
     tracing::info!("starting sync");
     let start = Instant::now();
