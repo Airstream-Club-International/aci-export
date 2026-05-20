@@ -97,9 +97,9 @@ pub enum BatchMethod {
 pub struct BatchInfo {
     pub id: String,
     status: BatchStatus,
-    total_operations: u16,
+    pub total_operations: u16,
     finished_operations: u16,
-    errored_operations: u16,
+    pub errored_operations: u16,
     submitted_at: DateTime<Utc>,
     completed_at: String,
     response_body_url: String,
