@@ -18,6 +18,16 @@ fn log_batch_member_retry(err: &Error, sleep: std::time::Duration) {
     tracing::warn!(%err, sleep = sleep.as_secs(), "batch member update");
 }
 
+/// MailChimp returns a per-member error when a contact is locked out of
+/// resubscribe by an abuse complaint, hard bounce, or unsubscribe — both the
+/// title ("Member In Compliance State") and the detail string contain the
+/// phrase "compliance state". The batch endpoint propagates the same phrase
+/// into `error`. Matching the phrase keeps us robust to MailChimp not
+/// committing to a stable `error_code` for this case across SDK versions.
+fn is_compliance_error(err: &MemberBatchUpsertError) -> bool {
+    err.error.contains("compliance state")
+}
+
 fn log_batch_tag_retry(err: &Error, sleep: std::time::Duration) {
     tracing::warn!(%err, sleep = sleep.as_secs(), "batch tag update");
 }
@@ -229,7 +239,27 @@ pub async fn upsert_many(
                 });
             if response.error_count > 0 {
                 response.errors.iter().for_each(|err| {
-                    tracing::warn!(email = err.email_address, err = err.error, "mailchimp");
+                    if is_compliance_error(err) {
+                        // MailChimp won't let an abuse-complaint / hard-bounce
+                        // / unsubscribe-locked contact be re-subscribed via the
+                        // API. They have to opt back in themselves. Log
+                        // distinctly so this is searchable in the sync log
+                        // (separate from generic upsert failures).
+                        tracing::warn!(
+                            email = err.email_address,
+                            error_code = err.error_code,
+                            err = err.error,
+                            kind = "compliance",
+                            "member locked in compliance state (abuse, bounce, or unsubscribe) — cannot resubscribe via API"
+                        );
+                    } else {
+                        tracing::warn!(
+                            email = err.email_address,
+                            error_code = err.error_code,
+                            err = err.error,
+                            "mailchimp upsert error"
+                        );
+                    }
                 })
             }
             Ok(())
