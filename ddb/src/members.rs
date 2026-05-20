@@ -894,6 +894,14 @@ pub mod mailchimp {
             to_update("lapsed", member, |m| {
                 m.member_status == MemberStatus::Lapsed
             }),
+            // Clear the sync-archive sentinel for every active member. If this
+            // sync just resubscribed a previously sync-archived member, the
+            // tag is now stale and would otherwise stick around. Idempotent
+            // for members that never carried the tag.
+            mc::members::MemberTagUpdate {
+                name: mc::members::SYNC_ARCHIVED_TAG.to_string(),
+                status: mc::members::MemberTagStatus::Inactive,
+            },
         ]
     }
     pub async fn to_members_with_address(

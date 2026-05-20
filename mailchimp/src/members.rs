@@ -18,6 +18,16 @@ fn log_batch_member_retry(err: &Error, sleep: std::time::Duration) {
     tracing::warn!(%err, sleep = sleep.as_secs(), "batch member update");
 }
 
+/// MailChimp returns a per-member error when a contact is locked out of
+/// resubscribe by an abuse complaint, hard bounce, or unsubscribe — both the
+/// title ("Member In Compliance State") and the detail string contain the
+/// phrase "compliance state". The batch endpoint propagates the same phrase
+/// into `error`. Matching the phrase keeps us robust to MailChimp not
+/// committing to a stable `error_code` for this case across SDK versions.
+fn is_compliance_error(err: &MemberBatchUpsertError) -> bool {
+    err.error.contains("compliance state")
+}
+
 fn log_batch_tag_retry(err: &Error, sleep: std::time::Duration) {
     tracing::warn!(%err, sleep = sleep.as_secs(), "batch tag update");
 }
@@ -81,44 +91,83 @@ pub async fn get(client: &Client, list_id: &str, member_id: &str) -> Result<Memb
         .await
 }
 
+/// HTTP DELETE on a member archives them in MailChimp — the contact is
+/// retained with `status: "archived"`, excluded from campaigns and counts.
+/// Permanent removal goes through a different endpoint.
 pub async fn delete(client: &Client, list_id: &str, member_id: &str) -> Result<()> {
     client
         .delete(&format!("/3.0/lists/{list_id}/members/{member_id}"))
         .await
 }
 
-/// Delete any members from the given list id not in a given retained set
+/// Tag applied immediately before a sync-driven archive in [`retain`], so a
+/// later sync run can tell sync-archived contacts (safe to re-subscribe when
+/// they reappear in the source) apart from contacts the audience owner
+/// archived by hand in the MailChimp UI (must stay archived).
+pub const SYNC_ARCHIVED_TAG: &str = "archived-by-sync";
+
+/// Archive every audience member not in `keep_keys`.
 ///
-/// Returns the numebr of deleted members from the given list
-pub async fn retain(client: &Client, list_id: &str, keep_keys: &HashSet<String>) -> Result<usize> {
-    // Iterate through all mailchimp audience member. Collect all members that are not
-    // the upserted set by set subtraction
-    let audience = all_collect(
-        client,
-        list_id,
-        MembersQuery {
-            fields: "members.id".to_string(),
-            ..Default::default()
-        },
-    )
-    .await?;
-    let audience_ids: HashSet<String> = audience
-        .into_iter()
-        .filter_map(|member| (member.status != Some(MemberStatus::Cleaned)).then_some(member.id))
+/// The audience is supplied by the caller (typically fetched once at the
+/// start of a sync run and reused) rather than refetched here. Members whose
+/// status is already `Archived` or `Cleaned` are skipped — there is nothing
+/// to archive, and re-touching an already-archived contact would clobber the
+/// admin-archived signal the next sync uses to decide whether to resubscribe.
+///
+/// Before each archive we set the [`SYNC_ARCHIVED_TAG`] tag so a future sync
+/// run can recognize sync-driven archives and resubscribe them safely.
+///
+/// Returns the number of newly archived members.
+pub async fn retain(
+    client: &Client,
+    list_id: &str,
+    audience: &[Member],
+    keep_keys: &HashSet<String>,
+) -> Result<usize> {
+    let to_archive: Vec<String> = audience
+        .iter()
+        .filter(|m| {
+            !matches!(
+                m.status,
+                Some(MemberStatus::Cleaned) | Some(MemberStatus::Archived)
+            )
+        })
+        .filter(|m| !keep_keys.contains(&m.id))
+        .map(|m| m.id.clone())
         .collect();
 
-    let to_delete = &audience_ids - keep_keys;
-    // Delete all to_delete entries
-    futures::stream::iter(to_delete.iter())
+    if to_archive.is_empty() {
+        return Ok(0);
+    }
+
+    // Tag before archiving so the next sync can distinguish these from
+    // admin-archived contacts. If the tag write fails we abort rather than
+    // archiving without the marker — better to leave a stale audience entry
+    // than to lose the ability to resubscribe a renewing member later.
+    let tag_updates: Vec<(String, Vec<MemberTagUpdate>)> = to_archive
+        .iter()
+        .map(|id| {
+            (
+                id.clone(),
+                vec![MemberTagUpdate {
+                    name: SYNC_ARCHIVED_TAG.to_string(),
+                    status: MemberTagStatus::Active,
+                }],
+            )
+        })
+        .collect();
+    tags::update_many(client, list_id, &tag_updates, RetryPolicy::with_retries(3)).await?;
+
+    futures::stream::iter(to_archive.iter())
         .map(|member_id| Ok::<_, crate::Error>((client.clone(), member_id)))
         .try_for_each_concurrent(10, |(client, member_id)| async move {
             delete(&client, list_id, member_id)
                 .await
-                .inspect_err(|err| tracing::error!(id = member_id, ?err, "failed to delete"))?;
+                .inspect_err(|err| tracing::error!(id = member_id, ?err, "failed to archive"))?;
             Ok(())
         })
         .await?;
-    Ok(to_delete.len())
+    Ok(to_archive.len())
 }
 
 pub async fn for_email(client: &Client, list_id: &str, email: &str) -> Result<Member> {
@@ -190,7 +239,27 @@ pub async fn upsert_many(
                 });
             if response.error_count > 0 {
                 response.errors.iter().for_each(|err| {
-                    tracing::warn!(email = err.email_address, err = err.error, "mailchimp");
+                    if is_compliance_error(err) {
+                        // MailChimp won't let an abuse-complaint / hard-bounce
+                        // / unsubscribe-locked contact be re-subscribed via the
+                        // API. They have to opt back in themselves. Log
+                        // distinctly so this is searchable in the sync log
+                        // (separate from generic upsert failures).
+                        tracing::warn!(
+                            email = err.email_address,
+                            error_code = err.error_code,
+                            err = err.error,
+                            kind = "compliance",
+                            "member locked in compliance state (abuse, bounce, or unsubscribe) — cannot resubscribe via API"
+                        );
+                    } else {
+                        tracing::warn!(
+                            email = err.email_address,
+                            error_code = err.error_code,
+                            err = err.error,
+                            "mailchimp upsert error"
+                        );
+                    }
                 })
             }
             Ok(())
@@ -368,7 +437,7 @@ pub struct Member {
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 pub struct MemberTag {
-    name: String,
+    pub name: String,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]

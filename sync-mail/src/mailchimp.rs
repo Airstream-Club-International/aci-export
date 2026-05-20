@@ -11,7 +11,8 @@ use std::{collections::HashSet, time::Instant};
 #[derive(Debug, serde::Serialize)]
 pub struct JobSyncResult {
     pub name: String,
-    pub deleted: usize,
+    pub archived: usize,
+    pub resubscribed: usize,
     pub upserted: usize,
 }
 
@@ -19,7 +20,8 @@ pub struct JobSyncResult {
 pub struct DryRunResult {
     pub name: String,
     pub upserted: usize,
-    pub would_delete: Vec<DryRunEntry>,
+    pub would_resubscribe: Vec<DryRunEntry>,
+    pub would_archive: Vec<DryRunEntry>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -229,11 +231,12 @@ impl Job {
                     let name = job.name.clone();
                     let id = job.id;
                     match job.sync(ddb_settings).await {
-                        Ok((deleted, upserted)) => Some((
+                        Ok((archived, resubscribed, upserted)) => Some((
                             id,
                             JobSyncResult {
                                 name,
-                                deleted,
+                                archived,
+                                resubscribed,
                                 upserted,
                             },
                         )),
@@ -304,16 +307,66 @@ impl Job {
         Ok((db_members, mc_members))
     }
 
+    /// Audience query used by `sync` and `dry_run`. We need `status` to skip
+    /// already-archived contacts in `retain`, and `tags` so we can tell
+    /// sync-archived (safe to resubscribe) from admin-archived (must remain
+    /// archived) when a previously-archived member reappears in the source.
+    fn audience_query() -> MembersQuery {
+        MembersQuery {
+            fields: "members.id,members.email_address,members.status,members.tags".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Ids of audience members archived by a previous sync run (status =
+    /// archived AND tagged with [`SYNC_ARCHIVED_TAG`]). Admin-archived
+    /// contacts lack the tag and are deliberately excluded so we never
+    /// resubscribe a contact the audience owner archived by hand.
+    fn sync_archived_ids(audience: &[mailchimp::members::Member]) -> HashSet<String> {
+        audience
+            .iter()
+            .filter(|m| m.status == Some(mailchimp::members::MemberStatus::Archived))
+            .filter(|m| {
+                m.tags
+                    .iter()
+                    .any(|t| t.name == mailchimp::members::SYNC_ARCHIVED_TAG)
+            })
+            .map(|m| m.id.clone())
+            .collect()
+    }
+
     #[tracing::instrument(skip_all, name = "sync", fields(name = self.name, id = self.id))]
-    pub async fn sync(&self, ddb_url: AciDatabaseSettings) -> Result<(usize, usize)> {
+    pub async fn sync(&self, ddb_url: AciDatabaseSettings) -> Result<(usize, usize, usize)> {
         let db = ddb_url.connect().await?;
+        let client = self.client()?;
         tracing::info!("starting sync");
         let start = Instant::now();
-        tracing::debug!("querying ddb");
-        let (db_members, mc_members) = self.prepare_mc_members(&db).await?;
+        tracing::debug!("querying ddb and audience");
 
-        tracing::debug!("upserting members");
-        let client = self.client()?;
+        // Run the Drupal prep and the MailChimp audience fetch in parallel; we
+        // need both before we can upsert (the audience tells us which members
+        // are sync-archived and need their status explicitly restored).
+        let (prep, audience) = tokio::try_join!(self.prepare_mc_members(&db), async {
+            mailchimp::members::all_collect(&client, &self.list, Self::audience_query())
+                .await
+                .map_err(anyhow::Error::from)
+        })?;
+        let (db_members, mut mc_members) = prep;
+
+        // For any member returning from a sync-driven archive, set status =
+        // Subscribed on the PUT so MailChimp lifts the archive. Other members
+        // keep `status_if_new` alone, so user-initiated unsubscribes via a
+        // campaign link stay intact.
+        let sync_archived = Self::sync_archived_ids(&audience);
+        let mut resubscribed = 0;
+        for member in &mut mc_members {
+            if sync_archived.contains(&member.id) {
+                member.status = Some(mailchimp::members::MemberStatus::Subscribed);
+                resubscribed += 1;
+            }
+        }
+
+        tracing::debug!(resubscribed, "upserting members");
         let upserted = mailchimp::members::upsert_many(
             &client,
             &self.list,
@@ -322,8 +375,9 @@ impl Job {
         )
         .await?;
 
-        tracing::debug!("deleting removed members");
-        let deleted = mailchimp::members::retain(&client, &self.list, &upserted).await?;
+        tracing::debug!("archiving removed members");
+        let archived =
+            mailchimp::members::retain(&client, &self.list, &audience, &upserted).await?;
 
         tracing::debug!("updating tags");
         let tag_updates = ddb::members::mailchimp::to_tag_updates(&db_members);
@@ -337,34 +391,32 @@ impl Job {
 
         let duration = start.elapsed().as_secs();
         tracing::info!(
-            deleted,
+            archived,
+            resubscribed,
             upserted = upserted.len(),
             duration,
             "sync completed"
         );
 
-        Ok((deleted, upserted.len()))
+        Ok((archived, resubscribed, upserted.len()))
     }
 
-    /// Compute what `sync()` would delete from MailChimp, without actually deleting
-    /// (and without upserting). Useful for verifying the retain() set before running
-    /// destructive changes.
+    /// Compute what `sync()` would archive and resubscribe in MailChimp,
+    /// without actually performing those writes (and without upserting).
+    /// Useful for verifying the retain set and the resubscribe set before
+    /// running destructive changes.
     #[tracing::instrument(skip_all, name = "dry_run", fields(name = self.name, id = self.id))]
     pub async fn dry_run(&self, ddb_url: AciDatabaseSettings) -> Result<DryRunResult> {
         let db = ddb_url.connect().await?;
         let client = self.client()?;
-        let audience_query = MembersQuery {
-            fields: "members.id,members.email_address,members.status".to_string(),
-            ..Default::default()
-        };
 
         // Drupal prep and the MailChimp audience fetch are independent — run
         // them in parallel so the audience round-trips overlap with the db work.
         let (prep, audience) = tokio::try_join!(self.prepare_mc_members(&db), async {
-            mailchimp::members::all_collect(&client, &self.list, audience_query)
+            mailchimp::members::all_collect(&client, &self.list, Self::audience_query())
                 .await
                 .map_err(anyhow::Error::from)
-        },)?;
+        })?;
         let (_db_members, mc_members) = prep;
 
         // Mirror what upsert_many would produce: the hash of each emitted email.
@@ -374,9 +426,26 @@ impl Job {
             .map(|m| member_id(&m.email_address))
             .collect();
 
-        let would_delete: Vec<DryRunEntry> = audience
+        let sync_archived = Self::sync_archived_ids(&audience);
+        let would_resubscribe: Vec<DryRunEntry> = audience
+            .iter()
+            .filter(|m| sync_archived.contains(&m.id) && upserted.contains(&m.id))
+            .map(|m| DryRunEntry {
+                id: m.id.clone(),
+                email_address: m.email_address.clone(),
+                status: m.status.clone(),
+            })
+            .collect();
+
+        let would_archive: Vec<DryRunEntry> = audience
             .into_iter()
-            .filter(|m| m.status != Some(mailchimp::members::MemberStatus::Cleaned))
+            .filter(|m| {
+                !matches!(
+                    m.status,
+                    Some(mailchimp::members::MemberStatus::Cleaned)
+                        | Some(mailchimp::members::MemberStatus::Archived)
+                )
+            })
             .filter(|m| !upserted.contains(&m.id))
             .map(|m| DryRunEntry {
                 id: m.id,
@@ -388,7 +457,8 @@ impl Job {
         Ok(DryRunResult {
             name: self.name.clone(),
             upserted: upserted.len(),
-            would_delete,
+            would_resubscribe,
+            would_archive,
         })
     }
 }
