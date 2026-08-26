@@ -817,19 +817,6 @@ pub mod db {
         }
     }
 
-    impl From<&Member> for Vec<app_db::brn::Brn> {
-        fn from(value: &Member) -> Vec<app_db::brn::Brn> {
-            value
-                .brns
-                .iter()
-                .map(|number| app_db::brn::Brn {
-                    user_id: app_db::user::id_for_email(&value.primary.email),
-                    number: number.to_owned(),
-                })
-                .collect()
-        }
-    }
-
     impl Address {
         pub fn to_db_address_for_member(self, member: &Member) -> app_db::address::Address {
             app_db::address::Address {
