@@ -171,17 +171,26 @@ pub async fn all_leadership(
         .map_err(Error::from)
 }
 
+/// `leadership_region.region` holds region uids, so a region number matches on
+/// the joined regions row rather than on the leadership column.
+fn leadership_by_number_query<'builder>(
+    region_number: i32,
+    filter: &leadership::DateFilter,
+) -> QueryBuilder<'builder, Postgres> {
+    let mut query = fetch_leadership_query();
+    query
+        .push("WHERE reg.number = ")
+        .push_bind(region_number as i64);
+    leadership::apply_date_filter(&mut query, filter, true);
+    query
+}
+
 pub async fn leadership_by_number(
     pool: &PgPool,
     region_number: i32,
     filter: leadership::DateFilter,
 ) -> Result<Vec<Leadership>> {
-    let mut query = fetch_leadership_query();
-    query
-        .push("WHERE lr.region = ")
-        .push_bind(region_number as i64);
-    leadership::apply_date_filter(&mut query, &filter, true);
-    query
+    leadership_by_number_query(region_number, &filter)
         .build_query_as::<Leadership>()
         .fetch_all(pool)
         .await
@@ -299,4 +308,23 @@ pub async fn retain_leadership(pool: &PgPool, leadership: &[Leadership]) -> Resu
     let total_affected = result.rows_affected();
     tx.commit().await?;
     Ok(total_affected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leadership::DateFilter;
+
+    #[test]
+    fn leadership_by_number_matches_the_region_number() {
+        // A region's number and its uid are different namespaces, and
+        // leadership_region.region holds the uid. Matching the number against
+        // that column returns nothing for a region that has leadership.
+        let query = leadership_by_number_query(5, &DateFilter::Current);
+
+        let sql = query.sql();
+        assert!(sql.contains("WHERE reg.number = $1"), "{sql}");
+        // The date filter composes onto that predicate; a second WHERE is invalid SQL.
+        assert_eq!(sql.matches("WHERE").count(), 1, "{sql}");
+    }
 }
