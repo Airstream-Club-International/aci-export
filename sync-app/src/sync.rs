@@ -2,7 +2,11 @@ use crate::{
     Context, Result,
     settings::{AciDatabaseSettings, AppSettings},
 };
-use db::{address, brn, club, leadership, member, region, standing_committee, user};
+use db::{
+    address,
+    brn::{self, ownership},
+    club, leadership, member, region, standing_committee, user,
+};
 use itertools::Itertools;
 use serde::Serialize;
 use sqlx::PgPool;
@@ -193,18 +197,12 @@ pub async fn retain_addresses(
     Ok(())
 }
 
-pub async fn upsert_brns(
-    db: &PgPool,
-    db_brns: &[brn::Brn],
-) -> Result<((String, SyncStats), Vec<brn::Brn>)> {
+pub async fn upsert_brns(db: &PgPool, db_brns: &[brn::Brn]) -> Result<(String, SyncStats)> {
     let start = Instant::now();
     let upserted = brn::upsert_many(db, db_brns).await?;
     let duration = start.elapsed().as_secs();
     tracing::info!(upserted, duration, "upserted brns");
-    Ok((
-        ("brns".to_string(), SyncStats::new(upserted, duration)),
-        db_brns.to_vec(),
-    ))
+    Ok(("brns".to_string(), SyncStats::new(upserted, duration)))
 }
 
 pub async fn retain_brns(
@@ -219,6 +217,65 @@ pub async fn retain_brns(
     stats.1.deleted = deleted;
     stats.1.duration += duration;
     Ok(())
+}
+
+// ========== BRN Ownership Sync ==========
+
+pub async fn upsert_brn_ownership(
+    db: &PgPool,
+    db_ownership: &[ownership::Ownership],
+) -> Result<(String, SyncStats)> {
+    let start = Instant::now();
+    let upserted = ownership::upsert_many(db, db_ownership).await?;
+    let duration = start.elapsed().as_secs();
+    tracing::info!(upserted, duration, "upserted brn ownership");
+    Ok((
+        "brn_ownership".to_string(),
+        SyncStats::new(upserted, duration),
+    ))
+}
+
+pub async fn retain_brn_ownership(
+    db: &PgPool,
+    stats: &mut (String, SyncStats),
+    db_ownership: &[ownership::Ownership],
+) -> Result<()> {
+    let start = Instant::now();
+    let deleted = ownership::retain(db, db_ownership).await?;
+    let duration = start.elapsed().as_secs();
+    tracing::info!(deleted, duration, "gc brn ownership");
+    stats.1.deleted = deleted;
+    stats.1.duration += duration;
+    Ok(())
+}
+
+/// Convert records that name their user by Drupal uid, dropping those whose user
+/// the sync does not carry and reporting how many.
+///
+/// BRN ownership reaches back further than the member sync window: a number's
+/// earlier holders may have left decades ago, and have no user row to hang from.
+fn for_synced_users<'a, T: 'a, U>(
+    user_ids_by_uid: &HashMap<u64, &str>,
+    records: impl IntoIterator<Item = &'a T>,
+    uid: impl Fn(&T) -> u64,
+    convert: impl Fn(&T, &str) -> U,
+    what: &str,
+) -> Vec<U> {
+    let mut dropped = 0usize;
+    let resolved = records
+        .into_iter()
+        .filter_map(|record| match user_ids_by_uid.get(&uid(record)) {
+            Some(user_id) => Some(convert(record, user_id)),
+            None => {
+                dropped += 1;
+                None
+            }
+        })
+        .collect_vec();
+    if dropped > 0 {
+        tracing::warn!(dropped, what, "records reference users outside the sync");
+    }
+    resolved
 }
 
 // ========== Leadership Role Sync ==========
@@ -481,11 +538,13 @@ pub async fn run(
     let ddb_clubs = ddb::clubs::all(&ddb).await?;
     let ddb_standing_committees = ddb::standing_committees::all(&ddb).await?;
     let ddb_members = ddb::members::all(&ddb).await?;
-    let db_brns = ddb_members
-        .iter()
-        .flat_map(Into::<Vec<brn::Brn>>::into)
-        .collect_vec();
     let mut ddb_addresses = ddb::members::mailing_address::for_members(&ddb, &ddb_members).await?;
+
+    // Current holders, then every recorded tenure. A number is reassigned when a
+    // member leaves or dies, so the current holder does not answer which number
+    // someone carried during a leadership term that has ended.
+    let ddb_brns = ddb::brns::all(&ddb).await?;
+    let ddb_brn_ownership = ddb::brns::history(&ddb).await?;
 
     // Fetch leadership data from DDB (all historical)
     let ddb_club_leadership =
@@ -539,7 +598,28 @@ pub async fn run(
     let (mut address_stats, db_addresses) =
         upsert_addresses(&db, &ddb_members, &mut ddb_addresses).await?;
     let (mut member_stats, db_members) = upsert_members(&db, ddb_members).await?;
-    let (mut brn_stats, db_brns) = upsert_brns(&db, &db_brns).await?;
+
+    // BRNs name their holder by Drupal uid; users are keyed by a hash of email.
+    let user_ids_by_uid: HashMap<u64, &str> = db_users
+        .iter()
+        .map(|db_user| (db_user.uid as u64, db_user.id.as_str()))
+        .collect();
+    let db_brns = for_synced_users(
+        &user_ids_by_uid,
+        &ddb_brns,
+        |ddb_brn| ddb_brn.user_uid,
+        ddb::brns::Brn::to_db_brn,
+        "brns",
+    );
+    let db_brn_ownership = for_synced_users(
+        &user_ids_by_uid,
+        &ddb_brn_ownership,
+        |ddb_ownership| ddb_ownership.user_uid,
+        ddb::brns::Ownership::to_db_ownership,
+        "brn_ownership",
+    );
+    let mut brn_stats = upsert_brns(&db, &db_brns).await?;
+    let mut brn_ownership_stats = upsert_brn_ownership(&db, &db_brn_ownership).await?;
 
     // Upsert leadership (depends on roles, clubs, regions, standing committees, users)
     // Filter to only leadership records referencing existing entities
@@ -598,6 +678,7 @@ pub async fn run(
     retain_regions(&db, &mut region_stats, &db_regions).await?;
     retain_standing_committees(&db, &mut standing_committee_stats, &db_standing_committees).await?;
     retain_brns(&db, &mut brn_stats, &db_brns).await?;
+    retain_brn_ownership(&db, &mut brn_ownership_stats, &db_brn_ownership).await?;
     retain_members(&db, &mut member_stats, &db_members).await?;
 
     // Retain leadership before retaining users/roles
@@ -625,6 +706,7 @@ pub async fn run(
 
     let stats: SyncStatsMap = [
         brn_stats,
+        brn_ownership_stats,
         address_stats,
         region_stats,
         club_stats,
@@ -640,4 +722,47 @@ pub async fn run(
     .into_iter()
     .collect();
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ddb_brn(user_uid: u64, number: &str) -> ddb::brns::Brn {
+        ddb::brns::Brn {
+            user_uid,
+            number: number.to_string(),
+        }
+    }
+
+    fn resolve(brns: &[ddb::brns::Brn]) -> Vec<brn::Brn> {
+        let user_ids_by_uid = HashMap::from([(7u64, "user-seven")]);
+        for_synced_users(
+            &user_ids_by_uid,
+            brns,
+            |ddb_brn| ddb_brn.user_uid,
+            ddb::brns::Brn::to_db_brn,
+            "brns",
+        )
+    }
+
+    #[test]
+    fn a_record_naming_a_synced_user_carries_that_users_id() {
+        let db_brns = resolve(&[ddb_brn(7, "00001")]);
+
+        assert_eq!(db_brns.len(), 1);
+        assert_eq!(db_brns[0].user_id, "user-seven");
+        assert_eq!(db_brns[0].number, "00001");
+    }
+
+    #[test]
+    fn a_record_naming_an_unsynced_user_is_dropped() {
+        // The users table has no row to point at, so the number cannot be stored.
+        let db_brns = resolve(&[ddb_brn(7, "00001"), ddb_brn(8, "00002")]);
+
+        assert_eq!(
+            db_brns.iter().map(|db_brn| &db_brn.number).collect_vec(),
+            ["00001"]
+        );
+    }
 }
