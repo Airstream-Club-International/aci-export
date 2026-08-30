@@ -11,14 +11,12 @@ use futures::TryFutureExt;
 use sqlx::MySqlPool;
 
 /// A single BRN record from Drupal (one row per BRN)
-#[derive(Debug, serde::Serialize, Clone)]
+#[derive(Debug, serde::Serialize)]
 pub struct Brn {
     /// Drupal user UID
     pub user_uid: u64,
     /// BRN number string (e.g., "07569")
     pub number: String,
-    /// Unix timestamp when BRN was acquired by current owner
-    pub acquire_date: Option<i64>,
 }
 
 /// Raw row from the `ssp_complete_brn` join
@@ -26,7 +24,6 @@ pub struct Brn {
 struct BrnRow {
     user_id: i64,
     brn_number: String,
-    acquire_date: Option<i64>,
 }
 
 /// Fetch all assigned BRNs from Drupal with acquire dates
@@ -35,8 +32,7 @@ pub async fn all(pool: &MySqlPool) -> Result<Vec<Brn>> {
         r#"
         SELECT
             b.user_id,
-            n.title AS brn_number,
-            b.acquire_date
+            n.title AS brn_number
         FROM ssp_complete_brn b
         JOIN node_field_data n ON n.nid = b.brn_id
         WHERE b.user_id IS NOT NULL
@@ -51,7 +47,6 @@ pub async fn all(pool: &MySqlPool) -> Result<Vec<Brn>> {
         .map(|row| Brn {
             user_uid: row.user_id as u64,
             number: row.brn_number.trim().to_string(),
-            acquire_date: row.acquire_date,
         })
         .collect();
 
@@ -60,9 +55,9 @@ pub async fn all(pool: &MySqlPool) -> Result<Vec<Brn>> {
 
 /// One continuous tenure of a BRN by a single user.
 ///
-/// `end_date` is `None` for the number's current owner. Every BRN has at most
-/// one such open span, and no other user's span starts after it.
-#[derive(Debug, serde::Serialize, Clone, PartialEq, Eq)]
+/// `end_date` is `None` for the number's current owner. Nothing here enforces
+/// one open span per number: a second would read as a second current owner.
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
 pub struct Ownership {
     /// BRN number string (e.g., "07569")
     pub number: String,
@@ -103,6 +98,14 @@ const FETCH_OWNERSHIP_HISTORY_QUERY: &str = r#"
         ON ed.entity_id = p.id AND ed.deleted = '0'
     WHERE o.deleted = '0'
       AND owner.field_member_target_id > 0
+      -- These dates are stored as text. A start date DATE() cannot parse decodes
+      -- as NULL and fails the row, taking the sync down; an unparseable end date
+      -- decodes as None, which reads as the current owner. Exclude both.
+      AND DATE(sd.field_start_date_value) IS NOT NULL
+      AND (
+          ed.field_end_date_value IS NULL
+          OR DATE(ed.field_end_date_value) IS NOT NULL
+      )
 "#;
 
 /// Fetch every recorded BRN tenure, one span per continuous ownership.
@@ -114,12 +117,32 @@ pub async fn history(pool: &MySqlPool) -> Result<Vec<Ownership>> {
         .await
 }
 
+impl OwnershipRow {
+    /// Drupal holds intervals whose end precedes their start. Such an interval
+    /// describes no tenure: it matches no date query, and merging it cuts the
+    /// tenure short at the bogus end, splitting the owner's later renewals off
+    /// into a second span.
+    fn ends_before_it_starts(&self) -> bool {
+        self.end_date
+            .is_some_and(|end_date| end_date < self.start_date)
+    }
+}
+
 /// Merge each run of adjacent same-owner intervals into a single span.
 ///
 /// Intervals a day or less apart continue a tenure; a longer gap starts a new
 /// span, so a number reacquired years later reads as two tenures rather than one
 /// that swallows the owner in between.
 fn coalesce(mut rows: Vec<OwnershipRow>) -> Vec<Ownership> {
+    let received = rows.len();
+    rows.retain(|row| !row.ends_before_it_starts());
+    let discarded = received - rows.len();
+    if discarded > 0 {
+        log::warn!(
+            "discarded {discarded} of {received} BRN ownership intervals that end before they start"
+        );
+    }
+
     rows.sort_by(|left, right| {
         left.number
             .cmp(&right.number)
@@ -308,6 +331,69 @@ mod tests {
                 span("00055", 300, "2013-01-01", None),
             ]
         );
+    }
+
+    #[test]
+    fn an_interval_ending_before_it_starts_is_discarded() {
+        // Number 03474 as Drupal holds it: owner 15945's two 2019 intervals both
+        // end before they start. Keeping them emits a span matching no date
+        // query, and cuts 15945's tenure so the 2020 renewal splits off.
+        let coalesced = coalesce(vec![
+            row("03474", 15858, "2019-06-21", Some("2019-10-27")),
+            row("03474", 15945, "2019-07-08", Some("2019-07-07")),
+            row("03474", 15945, "2019-07-08", Some("2019-06-20")),
+            row("03474", 15945, "2020-01-01", Some("2022-01-01")),
+            row("03474", 31503, "2022-03-14", None),
+        ]);
+
+        assert_eq!(
+            coalesced,
+            vec![
+                span("03474", 15858, "2019-06-21", Some("2019-10-27")),
+                span("03474", 15945, "2020-01-01", Some("2022-01-01")),
+                span("03474", 31503, "2022-03-14", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_span_ever_ends_before_it_starts() {
+        let coalesced = coalesce(vec![
+            row("00013", 700, "2019-07-08", Some("2019-07-07")),
+            row("00013", 700, "2020-01-01", Some("2022-01-01")),
+        ]);
+
+        assert!(
+            coalesced
+                .iter()
+                .all(|span| span.end_date.is_none_or(|end| end >= span.start_date)),
+            "{coalesced:?}"
+        );
+        assert_eq!(
+            coalesced,
+            vec![span("00013", 700, "2020-01-01", Some("2022-01-01"))]
+        );
+    }
+
+    #[test]
+    fn a_tenure_that_starts_and_ends_the_same_day_is_kept() {
+        // Drupal holds tenures a day long. Ending on the start date is a real
+        // interval, not the inverted shape, so discarding it would lose them.
+        let coalesced = coalesce(vec![row("00015", 850, "2019-07-08", Some("2019-07-08"))]);
+
+        assert_eq!(
+            coalesced,
+            vec![span("00015", 850, "2019-07-08", Some("2019-07-08"))]
+        );
+    }
+
+    #[test]
+    fn an_owner_whose_every_interval_is_inverted_drops_out() {
+        // The cost of discarding: a holder with nothing but bogus intervals
+        // leaves no tenure behind at all.
+        let coalesced = coalesce(vec![row("00014", 800, "2019-07-08", Some("2019-07-07"))]);
+
+        assert_eq!(coalesced, vec![]);
     }
 
     #[test]

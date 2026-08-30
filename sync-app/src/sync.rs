@@ -732,7 +732,6 @@ mod tests {
         ddb::brns::Brn {
             user_uid,
             number: number.to_string(),
-            acquire_date: None,
         }
     }
 

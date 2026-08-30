@@ -1,14 +1,15 @@
 use crate::{DB_INSERT_CHUNK_SIZE, Error, Result, retain_with_keys, user};
 use futures::{StreamExt, TryStreamExt, stream};
+use itertools::Itertools;
 use sqlx::{PgPool, Postgres};
 
-#[derive(Debug, sqlx::FromRow, serde::Serialize, Clone)]
+#[derive(Debug, sqlx::FromRow, serde::Serialize)]
 pub struct Brn {
     pub user_id: String,
     pub number: String,
 }
 
-pub const FETCH_BRN_QUERY: &str = r#"
+const FETCH_BRN_QUERY: &str = r#"
     SELECT
         user_id,
         number
@@ -46,7 +47,7 @@ pub async fn upsert_many(pool: &PgPool, brns: &[Brn]) -> Result<u64> {
     if brns.is_empty() {
         return Ok(0);
     }
-    let affected: Vec<u64> = stream::iter(brns)
+    let affected: Vec<u64> = stream::iter(brns.iter().unique_by(|brn| &brn.number))
         .chunks(DB_INSERT_CHUNK_SIZE)
         .map(Ok)
         .and_then(|chunk| async move {
@@ -86,12 +87,11 @@ pub async fn retain(pool: &PgPool, users: &[Brn]) -> Result<u64> {
 pub mod ownership {
     use super::*;
     use chrono::NaiveDate;
-    use itertools::Itertools;
     use sqlx::QueryBuilder;
 
     /// One continuous tenure of a BRN by a user. `end_date` is `None` for the
     /// current holder.
-    #[derive(Debug, sqlx::FromRow, serde::Serialize, Clone)]
+    #[derive(Debug, sqlx::FromRow, serde::Serialize)]
     pub struct Ownership {
         pub number: String,
         pub user_id: String,
