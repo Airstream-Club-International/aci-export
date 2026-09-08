@@ -1,0 +1,12 @@
+# Local working material that must not reach Railway's builder. The
+# Dockerfiles only copy the Cargo workspace members; everything else here is
+# scratch, analysis, or tooling state.
+.claude/
+.worktrees/
+spam-review/
+supabase/
+images/
+*.csv
+*.tsv
+*.md
+*.txt
