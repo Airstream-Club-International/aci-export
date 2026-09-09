@@ -402,14 +402,7 @@ impl Job {
                 .await?;
         members::apply_renames(&mut audience, &renamed.landed);
 
-        // A refused rename leaves the contact under its old address. Its
-        // source member is withheld from the upsert so the new address is
-        // not created beside it, and the old contact is kept out of retain
-        // so it is not archived. Both stay as they are until a later run
-        // succeeds.
-        let withheld: HashSet<String> = renamed.failed.iter().map(|r| member_id(&r.to)).collect();
-        mc_members.retain(|m| !withheld.contains(&m.id));
-        let mut keep: HashSet<String> = renamed.failed.iter().map(|r| r.id.clone()).collect();
+        let mut keep = withhold_failed_renames(&mut mc_members, &renamed.failed);
 
         // For any member returning from a sync-driven archive, set status =
         // Subscribed on the PUT so MailChimp lifts the archive. Other members
@@ -600,6 +593,19 @@ enum AudienceKind {
     Region,
 }
 
+/// A refused rename leaves the contact under its old address. Its source
+/// member is withheld from the upsert so the new address is not created
+/// beside it, and the old contact id is returned for retain's keep set so it
+/// is not archived. Both stay as they are until a later run succeeds.
+fn withhold_failed_renames(
+    mc_members: &mut Vec<Member>,
+    failed: &[EmailRename],
+) -> HashSet<String> {
+    let withheld: HashSet<String> = failed.iter().map(|r| member_id(&r.to)).collect();
+    mc_members.retain(|m| !withheld.contains(&m.id));
+    failed.iter().map(|r| r.id.clone()).collect()
+}
+
 /// Switch every preference on for members who are new to the audience or
 /// returning from a sync-driven archive, and count them. Every other
 /// contact is left untouched: their preferences are theirs to set on the
@@ -657,6 +663,25 @@ mod tests {
         assert_eq!(members[0].interests, Some(resolved.all_on()));
         assert_eq!(members[1].interests, Some(resolved.all_on()));
         assert_eq!(members[2].interests, None);
+    }
+
+    #[test]
+    fn failed_rename_withholds_the_target_and_keeps_the_old_contact() {
+        let mut members = vec![member("new@x.org"), member("other@x.org")];
+        let failed = vec![EmailRename {
+            id: member_id("old@x.org"),
+            from: "old@x.org".into(),
+            to: "new@x.org".into(),
+        }];
+        let keep = withhold_failed_renames(&mut members, &failed);
+        assert_eq!(
+            members
+                .iter()
+                .map(|m| m.email_address.as_str())
+                .collect::<Vec<_>>(),
+            ["other@x.org"]
+        );
+        assert_eq!(keep, [member_id("old@x.org")].into());
     }
 
     #[test]
