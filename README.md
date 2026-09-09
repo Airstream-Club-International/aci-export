@@ -68,3 +68,29 @@ Standard field names for query results:
 
 **Partner:**
 - `partner_uid`, `partner_last_login`, `partner_first_name`, `partner_last_name`, `partner_email`, `partner_birthday`
+
+## Email preferences on the all-members audience
+
+The all-members MailChimp audience carries an "Email Preferences" group, the
+checkboxes members see on the hosted preferences page linked from every
+campaign footer. Its shape lives in `mailchimp/data/interests-all.toml`, and
+`sync-mail interests` applies it. Every member is opted into every interest on
+joining; the member sync defaults new and returning members and never touches
+anyone else's choices.
+
+Changing the list:
+
+- **Add an interest.** Add it to the toml, run `sync-mail interests sync 1`
+  (creates it on the audience), then `sync-mail interests seed 1 --interest
+  "<name>"` so existing members are opted in without their other choices being
+  reset. Campaigns for it need a saved segment.
+- **Rename an interest.** Rename it in the MailChimp UI and in the toml in the
+  same change. Matching is by name: with only one side renamed, the member
+  sync logs "preference group is missing an interest" and skips defaulting,
+  and `interests sync` would create the new name beside the old one.
+- **Remove an interest.** Remove it from the toml and delete it in the
+  MailChimp UI. `interests sync` never deletes; until the UI side is done it
+  reports the interest as `extra`.
+
+Never run `interests seed` without `--interest` once the page is live: that
+form opts everyone into everything.

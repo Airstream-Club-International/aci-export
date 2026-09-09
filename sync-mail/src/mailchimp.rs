@@ -549,9 +549,7 @@ impl Job {
     /// audience if they are missing. Returns the resolved ids and the names
     /// of the interests created this call.
     #[tracing::instrument(skip_all, name = "interests", fields(name = self.name, id = self.id))]
-    pub async fn sync_interests(
-        &self,
-    ) -> Result<Option<(mailchimp::interests::Resolved, Vec<String>)>> {
+    pub async fn sync_interests(&self) -> Result<Option<mailchimp::interests::Synced>> {
         let Some(interests) = self.interests()? else {
             return Ok(None);
         };
@@ -563,21 +561,27 @@ impl Job {
             .await
     }
 
-    /// Switch every configured interest on for every contact in the
-    /// audience that is not archived or cleaned. A one-time step when the
-    /// group is first introduced; after that only new members are
-    /// defaulted, by `sync`.
+    /// Switch interests on for every contact in the audience that is not
+    /// archived or cleaned: every configured interest when `only` is empty,
+    /// otherwise just the named ones, leaving the rest as they are. The
+    /// first form introduces the group; the second rolls out an interest
+    /// added later. After that only new members are defaulted, by `sync`.
     ///
     /// Returns the number of contacts updated, or `None` when the job has no
     /// preference group or the group does not exist on the audience.
     #[tracing::instrument(skip_all, name = "seed_interests", fields(name = self.name, id = self.id))]
-    pub async fn seed_interests(&self) -> Result<Option<usize>> {
+    pub async fn seed_interests(&self, only: &[String]) -> Result<Option<usize>> {
         let Some(interests) = self.interests()? else {
             return Ok(None);
         };
         let client = self.client()?;
         let Some(resolved) = interests.resolve(&client, &self.list).await? else {
             return Ok(None);
+        };
+        let on = if only.is_empty() {
+            resolved.all_on()
+        } else {
+            resolved.on(only)?
         };
         let audience = members::all_collect(&client, &self.list, Self::audience_query()).await?;
         let member_ids: Vec<String> = audience
@@ -589,7 +593,7 @@ impl Job {
             &client,
             &self.list,
             &member_ids,
-            &resolved.all_on(),
+            &on,
             RetryPolicy::with_retries(3),
         )
         .await?;
@@ -660,7 +664,10 @@ mod tests {
     fn defaults_go_to_new_and_returning_members_only() {
         let resolved = Resolved {
             category_id: "cat".into(),
-            ids: vec!["i1".into()],
+            interests: vec![mailchimp::interests::ResolvedInterest {
+                name: "One".into(),
+                id: "i1".into(),
+            }],
         };
         let mut members = vec![
             member("new@x.org"),

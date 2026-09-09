@@ -149,33 +149,47 @@ impl Interests {
             return Ok(None);
         };
         let existing = interests(client, list_id, &category.id).await?;
-        Ok(Some(Resolved {
-            category_id: category.id,
-            ids: self.ids_in(&existing)?,
-        }))
+        Ok(Some(self.resolved_in(category.id, &existing)?))
     }
 
-    /// The id of each configured interest, in configured order, from the
+    /// Match each configured interest, in configured order, to the
     /// interests that exist on the audience. Errors on the first configured
     /// interest that is not there.
-    fn ids_in(&self, existing: &[Interest]) -> Result<Vec<String>> {
-        self.interests
+    fn resolved_in(&self, category_id: String, existing: &[Interest]) -> Result<Resolved> {
+        let interests = self
+            .interests
             .iter()
             .map(|wanted| {
                 existing
                     .iter()
                     .find(|i| i.name == wanted.name)
-                    .map(|i| i.id.clone())
+                    .map(|i| ResolvedInterest {
+                        name: i.name.clone(),
+                        id: i.id.clone(),
+                    })
                     .ok_or_else(|| Error::MissingInterest(wanted.name.clone()))
             })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Resolved {
+            category_id,
+            interests,
+        })
+    }
+
+    /// Interests on the audience that the config does not name. They are
+    /// never created or removed here; reporting them is how a rename made
+    /// in the MailChimp UI, or an interest dropped from config, gets seen.
+    fn extra_in(&self, existing: &[Interest]) -> Vec<String> {
+        existing
+            .iter()
+            .filter(|i| !self.interests.iter().any(|wanted| wanted.name == i.name))
+            .map(|i| i.name.clone())
             .collect()
     }
 
     /// Create the category and any missing interests, in configured order.
     /// Existing ones are matched by title and name and left alone.
-    ///
-    /// Returns the resolved ids and the names of the interests created.
-    pub async fn sync(&self, client: &Client, list_id: &str) -> Result<(Resolved, Vec<String>)> {
+    pub async fn sync(&self, client: &Client, list_id: &str) -> Result<Synced> {
         let category = match categories(client, list_id)
             .await?
             .into_iter()
@@ -196,51 +210,83 @@ impl Interests {
             }
         };
 
-        let existing = interests(client, list_id, &category.id).await?;
-        let mut ids = Vec::with_capacity(self.interests.len());
+        let mut existing = interests(client, list_id, &category.id).await?;
         let mut created = vec![];
         for (order, wanted) in self.interests.iter().enumerate() {
-            let interest = match existing.iter().find(|i| i.name == wanted.name) {
-                Some(interest) => interest.clone(),
-                None => {
-                    created.push(wanted.name.clone());
-                    create_interest(
-                        client,
-                        list_id,
-                        &category.id,
-                        &Interest {
-                            id: String::new(),
-                            name: wanted.name.clone(),
-                            display_order: Some(order as u32 + 1),
-                        },
-                    )
-                    .await?
-                }
-            };
-            ids.push(interest.id);
+            if existing.iter().any(|i| i.name == wanted.name) {
+                continue;
+            }
+            created.push(wanted.name.clone());
+            let interest = create_interest(
+                client,
+                list_id,
+                &category.id,
+                &Interest {
+                    id: String::new(),
+                    name: wanted.name.clone(),
+                    display_order: Some(order as u32 + 1),
+                },
+            )
+            .await?;
+            existing.push(interest);
         }
-        Ok((
-            Resolved {
-                category_id: category.id,
-                ids,
-            },
+        Ok(Synced {
+            resolved: self.resolved_in(category.id, &existing)?,
             created,
-        ))
+            extra: self.extra_in(&existing),
+        })
     }
 }
 
-/// Interest ids for a configured category as they exist on one audience.
+/// Outcome of [`Interests::sync`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Synced {
+    pub resolved: Resolved,
+    /// Names of the interests created by this call
+    pub created: Vec<String>,
+    /// Names of interests on the audience that the config does not name
+    pub extra: Vec<String>,
+}
+
+/// A configured category as it exists on one audience.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Resolved {
     pub category_id: String,
-    pub ids: Vec<String>,
+    /// In configured order
+    pub interests: Vec<ResolvedInterest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResolvedInterest {
+    pub name: String,
+    pub id: String,
 }
 
 impl Resolved {
     /// Every configured interest switched on: the default for a member new
     /// to the audience.
     pub fn all_on(&self) -> HashMap<String, bool> {
-        self.ids.iter().map(|id| (id.clone(), true)).collect()
+        self.interests
+            .iter()
+            .map(|i| (i.id.clone(), true))
+            .collect()
+    }
+
+    /// Only the named interests switched on, leaving the rest as they are.
+    /// This is how an interest added later is rolled out to existing
+    /// members without touching the choices they have already made. Errors
+    /// on a name that is not a configured interest.
+    pub fn on(&self, names: &[String]) -> Result<HashMap<String, bool>> {
+        names
+            .iter()
+            .map(|name| {
+                self.interests
+                    .iter()
+                    .find(|i| &i.name == name)
+                    .map(|i| (i.id.clone(), true))
+                    .ok_or_else(|| Error::MissingInterest(name.clone()))
+            })
+            .collect()
     }
 }
 
@@ -318,10 +364,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ids_in_requires_every_configured_interest() {
-        let config = Interests::all().expect("parse bundled config");
-        let mut existing: Vec<Interest> = config
+    fn existing_for(config: &Interests) -> Vec<Interest> {
+        config
             .interests
             .iter()
             .enumerate()
@@ -330,28 +374,73 @@ mod tests {
                 name: i.name.clone(),
                 display_order: None,
             })
-            .collect();
-        let ids = config.ids_in(&existing).expect("all present");
-        assert_eq!(ids.len(), config.interests.len());
-        assert_eq!(ids[2], "id2");
+            .collect()
+    }
+
+    #[test]
+    fn resolved_in_requires_every_configured_interest() {
+        let config = Interests::all().expect("parse bundled config");
+        let mut existing = existing_for(&config);
+        let resolved = config
+            .resolved_in("cat".into(), &existing)
+            .expect("all present");
+        assert_eq!(resolved.interests.len(), config.interests.len());
+        assert_eq!(resolved.interests[2].id, "id2");
+        assert_eq!(resolved.interests[2].name, "Caravans");
 
         existing.remove(2);
-        match config.ids_in(&existing) {
+        match config.resolved_in("cat".into(), &existing) {
             Err(Error::MissingInterest(name)) => assert_eq!(name, "Caravans"),
             other => panic!("expected MissingInterest, got {other:?}"),
         }
     }
 
     #[test]
-    fn all_on_switches_every_resolved_interest_on() {
-        let resolved = Resolved {
+    fn extra_in_reports_interests_the_config_does_not_name() {
+        let config = Interests::all().expect("parse bundled config");
+        let mut existing = existing_for(&config);
+        assert_eq!(config.extra_in(&existing), Vec::<String>::new());
+        existing.push(Interest {
+            id: "x".into(),
+            name: "Renamed In The UI".into(),
+            display_order: None,
+        });
+        assert_eq!(config.extra_in(&existing), ["Renamed In The UI"]);
+    }
+
+    fn resolved() -> Resolved {
+        Resolved {
             category_id: "cat".into(),
-            ids: vec!["a".into(), "b".into()],
-        };
+            interests: vec![
+                ResolvedInterest {
+                    name: "A".into(),
+                    id: "a".into(),
+                },
+                ResolvedInterest {
+                    name: "B".into(),
+                    id: "b".into(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn all_on_switches_every_resolved_interest_on() {
         let mut expected = HashMap::new();
         expected.insert("a".to_string(), true);
         expected.insert("b".to_string(), true);
-        assert_eq!(resolved.all_on(), expected);
+        assert_eq!(resolved().all_on(), expected);
+    }
+
+    #[test]
+    fn on_names_only_the_asked_interests_and_rejects_unknown_ones() {
+        let mut expected = HashMap::new();
+        expected.insert("b".to_string(), true);
+        assert_eq!(resolved().on(&["B".to_string()]).expect("known"), expected);
+        match resolved().on(&["C".to_string()]) {
+            Err(Error::MissingInterest(name)) => assert_eq!(name, "C"),
+            other => panic!("expected MissingInterest, got {other:?}"),
+        }
     }
 
     #[test]

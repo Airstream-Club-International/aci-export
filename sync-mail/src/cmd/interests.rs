@@ -35,11 +35,13 @@ async fn job(settings: &Settings, id: u64) -> Result<Job> {
         .ok_or_else(|| anyhow::anyhow!("sync job not found"))
 }
 
-/// Create the preference group and its interests on the audience if missing.
+/// Create the preference group and any missing interests on the audience.
 ///
 /// MailChimp shows a group on the audience's hosted forms as soon as it
 /// exists, so run this when the preferences page is ready to go live, and
-/// follow it with `seed` so existing members start opted in.
+/// follow it with `seed` so existing members start opted in. Interests on
+/// the audience that the config does not name are reported as `extra` and
+/// left alone.
 #[derive(Debug, clap::Args)]
 pub struct Sync {
     /// The id of the sync job
@@ -48,28 +50,29 @@ pub struct Sync {
 
 impl Sync {
     pub async fn run(&self, settings: Settings) -> Result {
-        #[derive(Debug, serde::Serialize)]
-        struct SyncResult {
-            resolved: mailchimp::interests::Resolved,
-            created: Vec<String>,
-        }
         let job = job(&settings, self.id).await?;
         match job.sync_interests().await? {
-            Some((resolved, created)) => print_json(&SyncResult { resolved, created }),
+            Some(synced) => print_json(&synced),
             None => anyhow::bail!("job {} has no preference group configured", job.name),
         }
     }
 }
 
-/// Opt every current contact into all interests of the preference group.
+/// Opt every current contact into interests of the preference group.
 ///
-/// One-time step after `sync` introduces the group. Overwrites any choice a
-/// member has already made on the preferences page, so do not run it again
-/// once the page is live.
+/// With no `--interest`, every configured interest is switched on: the
+/// one-time step after `sync` introduces the group. It overwrites any
+/// choice a member has already made on the preferences page, so do not
+/// run that form again once the page is live. With `--interest`, only the
+/// named interests are switched on and the rest are left as they are: how
+/// an interest added later reaches existing members.
 #[derive(Debug, clap::Args)]
 pub struct Seed {
     /// The id of the sync job
     id: u64,
+    /// Switch on only this interest, by its configured name (repeatable)
+    #[arg(long = "interest")]
+    only: Vec<String>,
 }
 
 impl Seed {
@@ -79,7 +82,7 @@ impl Seed {
             seeded: usize,
         }
         let job = job(&settings, self.id).await?;
-        match job.seed_interests().await? {
+        match job.seed_interests(&self.only).await? {
             Some(seeded) => print_json(&SeedResult { seeded }),
             None => anyhow::bail!(
                 "job {} has no preference group configured, or it is not on the audience yet (run `interests sync` first)",
