@@ -123,6 +123,12 @@ pub struct MergeField {
 
     #[serde(default)]
     pub r#type: MergeType,
+    /// Whether the field is shown on the audience's hosted forms (signup and
+    /// update-profile). Hidden by default: every synced field is owned by the
+    /// membership database, and a value a member edits on a MailChimp form is
+    /// overwritten on the next sync run.
+    #[serde(default)]
+    pub public: bool,
 }
 
 impl Default for MergeField {
@@ -132,6 +138,7 @@ impl Default for MergeField {
             tag: "".to_string(),
             name: "".to_string(),
             r#type: MergeType::default(),
+            public: false,
         }
     }
 }
@@ -383,7 +390,58 @@ paged_query_impl!(
         "merge_fields.merge_id",
         "merge_fields.tag",
         "merge_fields.name",
-        "merge_fields.type"
+        "merge_fields.type",
+        "merge_fields.public"
     ]
 );
 paged_response_impl!(MergeFieldsResponse, merge_fields, MergeField);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_fetches_the_public_flag() {
+        // sync() compares the fetched field against config; a fetch that
+        // omits `public` would read every field as hidden and never fix one.
+        assert!(
+            MergeFieldsQuery::default()
+                .fields
+                .split(',')
+                .any(|f| f == "merge_fields.public")
+        );
+    }
+
+    #[test]
+    fn config_field_defaults_to_hidden() {
+        assert!(!MergeField::default().public);
+        let fields = MergeFields::from_config(config::File::from_str(
+            r#"
+            [[merge_fields]]
+            tag = "FNAME"
+            name = "First Name"
+            type = "text"
+            "#,
+            config::FileFormat::Toml,
+        ))
+        .expect("parse config");
+        assert!(!fields.get("FNAME").expect("FNAME present").public);
+    }
+
+    #[test]
+    fn api_public_flag_is_compared() {
+        // The shape MailChimp returns for a UI-created field; `public` must
+        // survive deserialization so the sync sees it differ from config.
+        let fixture = r#"{"merge_id":1,"tag":"FNAME","name":"First Name","type":"text","required":false,"public":true}"#;
+        let current: MergeField = serde_json::from_str(fixture).expect("parse fixture");
+        assert!(current.public);
+        let target = MergeField {
+            merge_id: 1,
+            tag: "FNAME".into(),
+            name: "First Name".into(),
+            r#type: MergeType::Text,
+            public: false,
+        };
+        assert_ne!(target, current);
+    }
+}

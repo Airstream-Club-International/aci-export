@@ -72,3 +72,11 @@ type = "date"
 tag = "BRN"
 name = "Primary BRN"
 type = "text"
+
+# Not written by the sync. Holds each household's KOA partner code, loaded
+# by spreadsheet import into the all-members audience. Listed here so the
+# field sync keeps it and keeps it hidden from the hosted forms.
+[[merge_fields]]
+tag = "MMERGE14"
+name = "KOA Code"
+type = "text"

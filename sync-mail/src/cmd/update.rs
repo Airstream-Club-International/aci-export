@@ -15,6 +15,9 @@ pub struct Cmd {
     api_key: Option<String>,
     #[arg(long)]
     list: Option<String>,
+    /// Bundled interest config the audience carries (for example "aci")
+    #[arg(long)]
+    interests: Option<String>,
 }
 
 impl From<&Cmd> for JobUpdate {
@@ -26,6 +29,7 @@ impl From<&Cmd> for JobUpdate {
             region: value.region,
             api_key: value.api_key.clone(),
             list: value.list.clone(),
+            interests: value.interests.clone(),
         }
     }
 }

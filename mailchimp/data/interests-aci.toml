@@ -1,0 +1,29 @@
+# The "Email Preferences" group on the ACI all-members audience. Members
+# manage these from the hosted preferences page linked in every campaign
+# footer. Order here is the display order on that page. A job maintains this
+# group when its `interests` setting names this config ("aci").
+
+[category]
+title = "Email Preferences"
+type = "checkboxes"
+
+[[interests]]
+name = "General Club Information"
+
+[[interests]]
+name = "Member Benefits/Partners"
+
+[[interests]]
+name = "Caravans"
+
+[[interests]]
+name = "Short-Notice Caravan Go List"
+
+[[interests]]
+name = "International Rally"
+
+[[interests]]
+name = "National Event Rallies"
+
+[[interests]]
+name = "Club Business (Governance)"

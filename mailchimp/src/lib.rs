@@ -19,6 +19,7 @@ mod error;
 
 pub mod batches;
 pub mod health;
+pub mod interests;
 pub mod lists;
 pub mod members;
 pub mod merge_fields;

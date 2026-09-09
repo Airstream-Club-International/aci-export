@@ -27,7 +27,15 @@ impl Cmd {
             return print_json(&map);
         }
 
-        let map = Job::sync_many(jobs, settings.ddb).await;
-        print_json(&map)
+        let (map, failures) = Job::sync_many(jobs, settings.ddb).await;
+        print_json(&map)?;
+        if failures.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<String> = failures
+            .iter()
+            .map(|(name, err)| format!("{name}: {err:#}"))
+            .collect();
+        anyhow::bail!("{} job(s) failed: {}", failures.len(), names.join("; "))
     }
 }

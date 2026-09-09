@@ -68,3 +68,39 @@ Standard field names for query results:
 
 **Partner:**
 - `partner_uid`, `partner_last_login`, `partner_first_name`, `partner_last_name`, `partner_email`, `partner_birthday`
+
+## Email preferences on the all-members audience
+
+The ACI all-members MailChimp audience carries an "Email Preferences" group,
+the checkboxes members see on the hosted preferences page linked from every
+campaign footer. Its shape lives in `mailchimp/data/interests-aci.toml`. A
+group belongs to one audience: a job maintains it only when the job's
+`interests` setting names that config (`sync-mail update 1 --interests aci`),
+and a job with no setting has no group. `sync-mail interests` applies it.
+Every member is opted into every interest on joining; the member sync defaults
+new and returning members and never touches anyone else's choices.
+
+Changing the list:
+
+- **Add an interest.** Add it to the toml, run `sync-mail interests sync 1`
+  (creates it on the audience), then `sync-mail interests seed 1 --interest
+  "<name>"` so existing members are opted in without their other choices being
+  reset. Campaigns for it need a saved segment.
+- **Rename an interest.** Change `name` in the toml and list the old name
+  under `was`, then run `sync-mail interests sync 1`. The interest is renamed
+  in place and members' settings for it are kept. Renaming only in the
+  MailChimp UI leaves the member sync unable to match it: it logs "preference
+  group is missing an interest" and skips defaulting until the toml catches up.
+- **Remove an interest.** Remove it from the toml and run `sync-mail interests
+  sync 1 --process-deletes`. Without the flag the interest is reported as
+  `extra` and left alone. Deleting it drops every member's setting for it.
+
+Never run `interests seed` without `--interest` once the page is live: that
+form opts everyone into everything.
+
+Edits made to the group in the MailChimp UI are the failure to watch for.
+The member sync refuses to run, before writing anything, when a configured
+interest is missing from the audience, so the scheduled run fails and the
+error names the interest. `sync-mail interests check 1` compares the audience
+to the config without changing anything and exits non-zero on any difference,
+including interests added in the UI; schedule it alongside the sync.

@@ -126,12 +126,7 @@ pub async fn retain(
 ) -> Result<usize> {
     let to_archive: Vec<String> = audience
         .iter()
-        .filter(|m| {
-            !matches!(
-                m.status,
-                Some(MemberStatus::Cleaned) | Some(MemberStatus::Archived)
-            )
-        })
+        .filter(|m| m.is_live())
         .filter(|m| !keep_keys.contains(&m.id))
         .map(|m| m.id.clone())
         .collect();
@@ -199,6 +194,186 @@ pub async fn upsert(
             member,
         )
         .await
+}
+
+/// PATCH the given fields of an existing contact. Only the fields set on
+/// `member` are sent, so this is how to change one attribute (such as the
+/// email address) without restating the rest of the record.
+async fn update(
+    client: &Client,
+    list_id: &str,
+    member_id: &str,
+    member: &Member,
+) -> Result<Member> {
+    client
+        .patch(
+            &format!("/3.0/lists/{list_id}/members/{member_id}",),
+            member,
+        )
+        .await
+}
+
+/// A contact whose email address in MailChimp no longer matches the address
+/// the membership database holds for the same user.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EmailRename {
+    /// Current MailChimp contact id (hash of the current address)
+    pub id: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// Pair audience contacts with source members by the `UID` merge field and
+/// report every contact whose address differs from the source.
+///
+/// A contact is keyed by the hash of its email, so an address changed on
+/// either side (a member editing it on a MailChimp form, or a change in the
+/// membership database) makes the source member and the audience contact
+/// look like two unrelated records: the sync would create the new address
+/// fresh and archive the old one, and the contact's group preferences would
+/// go to the archive with it. Renaming the existing contact instead keeps
+/// its record, and with it those preferences.
+///
+/// Archived and cleaned contacts are left alone: they are handled by the
+/// resubscribe and retain paths. A rename is also skipped when the target
+/// address already exists in the audience (both records present), or when
+/// more than one live contact or more than one target carries the same
+/// `UID`, or two targets want the same address, since none of those has a
+/// single contact to rename to a single address.
+pub fn email_renames(audience: &[Member], targets: &[Member]) -> Vec<EmailRename> {
+    let audience_ids: HashSet<&str> = audience.iter().map(|m| m.id.as_str()).collect();
+
+    let mut by_uid: HashMap<u64, Vec<&Member>> = HashMap::new();
+    for member in audience.iter().filter(|m| m.is_live()) {
+        if let Some(uid) = member.uid() {
+            by_uid.entry(uid).or_default().push(member);
+        }
+    }
+
+    let mut targets_per_uid: HashMap<u64, usize> = HashMap::new();
+    let mut targets_per_id: HashMap<&str, usize> = HashMap::new();
+    for target in targets {
+        if let Some(uid) = target.uid() {
+            *targets_per_uid.entry(uid).or_default() += 1;
+        }
+        *targets_per_id.entry(target.id.as_str()).or_default() += 1;
+    }
+
+    targets
+        .iter()
+        .filter(|target| !audience_ids.contains(target.id.as_str()))
+        .filter(|target| targets_per_id[target.id.as_str()] == 1)
+        .filter_map(|target| {
+            let uid = target.uid()?;
+            if targets_per_uid[&uid] != 1 {
+                return None;
+            }
+            match by_uid.get(&uid).map(Vec::as_slice) {
+                Some([current]) => Some(EmailRename {
+                    id: current.id.clone(),
+                    from: current.email_address.clone(),
+                    to: target.email_address.clone(),
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn log_rename_retry(err: &Error, sleep: std::time::Duration) {
+    tracing::warn!(%err, sleep = sleep.as_secs(), "member rename");
+}
+
+/// Outcome of [`rename_many`]: the renames that landed and the ones
+/// MailChimp refused.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Renamed {
+    pub landed: Vec<EmailRename>,
+    pub failed: Vec<EmailRename>,
+}
+
+/// Apply [`email_renames`] results. A rename that MailChimp rejects is
+/// reported in `failed` rather than failing the run; the caller decides
+/// what to do with that contact.
+///
+/// A rename whose PATCH was applied but whose response was lost fails its
+/// retry with a 404 on the old id. Before scoring such a rename as failed,
+/// the new id is probed and, if the contact is there, the rename counts as
+/// landed.
+///
+/// A landed rename means the contact is keyed by the hash of its new
+/// address from this point on, so the caller's copy of the audience needs
+/// [`apply_renames`].
+pub async fn rename_many(
+    client: &Client,
+    list_id: &str,
+    renames: &[EmailRename],
+    retries: RetryPolicy,
+) -> Result<Renamed> {
+    let outcome = Arc::new(RwLock::new(Renamed::default()));
+    stream::iter(renames)
+        .map(Ok::<_, Error>)
+        .try_for_each_concurrent(10, |rename| {
+            let client = client.clone();
+            let outcome = outcome.clone();
+            async move {
+                let patch = Member {
+                    email_address: rename.to.clone(),
+                    ..Default::default()
+                };
+                let result = Retry::spawn_notify(
+                    retries,
+                    || update(&client, list_id, &rename.id, &patch).map_err(Error::into_retry),
+                    log_rename_retry,
+                )
+                .await;
+                let landed = match result {
+                    Ok(_) => true,
+                    Err(err) => {
+                        // A 404 on the old id is what a PATCH that landed
+                        // without a response looks like on retry; any other
+                        // error is a refusal.
+                        let is_gone = matches!(&err, Error::Mailchimp(e) if e.status == 404);
+                        let landed = is_gone
+                            && for_id(&client, list_id, &member_id(&rename.to))
+                                .await
+                                .is_ok();
+                        if !landed {
+                            tracing::warn!(
+                                id = rename.id,
+                                from = rename.from,
+                                to = rename.to,
+                                %err,
+                                "member rename failed"
+                            );
+                        }
+                        landed
+                    }
+                };
+                let mut outcome = outcome.write().await;
+                if landed {
+                    outcome.landed.push(rename.clone());
+                } else {
+                    outcome.failed.push(rename.clone());
+                }
+                Ok(())
+            }
+        })
+        .await?;
+    let outcome = outcome.read().await.clone();
+    Ok(outcome)
+}
+
+/// Rewrite the audience entries for landed renames so later steps (retain,
+/// new-member detection) see the contact under its new address.
+pub fn apply_renames(audience: &mut [Member], renamed: &[EmailRename]) {
+    let by_id: HashMap<&str, &EmailRename> = renamed.iter().map(|r| (r.id.as_str(), r)).collect();
+    for member in audience.iter_mut() {
+        if let Some(rename) = by_id.get(member.id.as_str()) {
+            member.id = member_id(&rename.to);
+            member.email_address = rename.to.clone();
+        }
+    }
 }
 
 /// Recommended max batch upsert size.
@@ -436,10 +611,37 @@ pub struct Member {
     pub status: Option<MemberStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_fields: Option<HashMap<String, serde_json::Value>>,
+    /// Group (interest) membership keyed by interest id. Only sent when set;
+    /// MailChimp leaves any interest not named in the map untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interests: Option<HashMap<String, bool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags_count: Option<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<MemberTag>,
+}
+
+impl Member {
+    /// A contact that campaigns can still reach or that a member can still
+    /// act on. Archived and cleaned contacts are neither; they are handled
+    /// only by the resubscribe path.
+    pub fn is_live(&self) -> bool {
+        !matches!(
+            self.status,
+            Some(MemberStatus::Archived) | Some(MemberStatus::Cleaned)
+        )
+    }
+
+    /// The membership database user id carried in the `UID` merge field.
+    /// MailChimp returns a number for a populated numeric field and an empty
+    /// string for an unset one; a numeric string is accepted as well.
+    pub fn uid(&self) -> Option<u64> {
+        match self.merge_fields.as_ref()?.get("UID")? {
+            serde_json::Value::Number(n) => n.as_u64(),
+            serde_json::Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
@@ -481,3 +683,200 @@ paged_query_impl!(
     &["members.id", "members.email_address", "members.full_name",]
 );
 paged_response_impl!(MembersResponse, members, Member);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contact(email: &str, uid: Option<u64>, status: MemberStatus) -> Member {
+        let mut merge_fields = HashMap::new();
+        merge_fields.insert(
+            "UID".to_string(),
+            match uid {
+                Some(uid) => serde_json::json!(uid),
+                None => serde_json::json!(""),
+            },
+        );
+        Member {
+            id: member_id(email),
+            email_address: email.to_string(),
+            status: Some(status),
+            merge_fields: Some(merge_fields),
+            ..Default::default()
+        }
+    }
+
+    fn source(email: &str, uid: u64) -> Member {
+        contact(email, Some(uid), MemberStatus::Noop)
+    }
+
+    #[test]
+    fn uid_reads_number_and_numeric_string_and_rejects_empty() {
+        assert_eq!(
+            contact("a@x.org", Some(7), MemberStatus::Subscribed).uid(),
+            Some(7)
+        );
+        let mut m = contact("a@x.org", None, MemberStatus::Subscribed);
+        assert_eq!(m.uid(), None);
+        m.merge_fields
+            .as_mut()
+            .expect("merge fields")
+            .insert("UID".into(), serde_json::json!("42"));
+        assert_eq!(m.uid(), Some(42));
+        m.merge_fields = None;
+        assert_eq!(m.uid(), None);
+    }
+
+    #[test]
+    fn address_changed_on_either_side_is_a_rename() {
+        let audience = vec![contact("old@x.org", Some(1), MemberStatus::Subscribed)];
+        let targets = vec![source("new@x.org", 1)];
+        assert_eq!(
+            email_renames(&audience, &targets),
+            vec![EmailRename {
+                id: member_id("old@x.org"),
+                from: "old@x.org".into(),
+                to: "new@x.org".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn unsubscribed_contact_is_still_renamed() {
+        // Preferences on an unsubscribed record are as worth keeping as any;
+        // only archived and cleaned contacts are excluded.
+        let audience = vec![contact("old@x.org", Some(1), MemberStatus::Unsubscribed)];
+        let targets = vec![source("new@x.org", 1)];
+        assert_eq!(email_renames(&audience, &targets).len(), 1);
+    }
+
+    #[test]
+    fn matching_address_is_not_a_rename() {
+        let audience = vec![contact("same@x.org", Some(1), MemberStatus::Subscribed)];
+        let targets = vec![source("same@x.org", 1)];
+        assert_eq!(email_renames(&audience, &targets), vec![]);
+    }
+
+    #[test]
+    fn archived_and_cleaned_contacts_are_left_to_retain_and_resubscribe() {
+        for status in [MemberStatus::Archived, MemberStatus::Cleaned] {
+            let audience = vec![contact("old@x.org", Some(1), status)];
+            let targets = vec![source("new@x.org", 1)];
+            assert_eq!(email_renames(&audience, &targets), vec![]);
+        }
+    }
+
+    #[test]
+    fn target_already_present_is_not_a_rename() {
+        // Both addresses exist as contacts: nothing to rename, the old one
+        // goes through retain.
+        let audience = vec![
+            contact("old@x.org", Some(1), MemberStatus::Subscribed),
+            contact("new@x.org", Some(1), MemberStatus::Subscribed),
+        ];
+        let targets = vec![source("new@x.org", 1)];
+        assert_eq!(email_renames(&audience, &targets), vec![]);
+    }
+
+    #[test]
+    fn duplicate_uid_in_audience_is_ambiguous() {
+        let audience = vec![
+            contact("one@x.org", Some(1), MemberStatus::Subscribed),
+            contact("two@x.org", Some(1), MemberStatus::Subscribed),
+        ];
+        let targets = vec![source("three@x.org", 1)];
+        assert_eq!(email_renames(&audience, &targets), vec![]);
+    }
+
+    #[test]
+    fn two_targets_with_one_uid_are_ambiguous() {
+        let audience = vec![contact("old@x.org", Some(1), MemberStatus::Subscribed)];
+        let targets = vec![source("a@x.org", 1), source("b@x.org", 1)];
+        assert_eq!(email_renames(&audience, &targets), vec![]);
+    }
+
+    #[test]
+    fn two_targets_wanting_one_address_are_ambiguous() {
+        // A household consolidating onto one inbox: two live contacts, one
+        // address wanted by both. Neither is renamed.
+        let audience = vec![
+            contact("a@x.org", Some(1), MemberStatus::Subscribed),
+            contact("b@x.org", Some(2), MemberStatus::Subscribed),
+        ];
+        let targets = vec![source("shared@x.org", 1), source("shared@x.org", 2)];
+        assert_eq!(email_renames(&audience, &targets), vec![]);
+    }
+
+    #[test]
+    fn is_live_excludes_archived_and_cleaned_only() {
+        for (status, live) in [
+            (MemberStatus::Subscribed, true),
+            (MemberStatus::Unsubscribed, true),
+            (MemberStatus::Pending, true),
+            (MemberStatus::Transactional, true),
+            (MemberStatus::Archived, false),
+            (MemberStatus::Cleaned, false),
+        ] {
+            assert_eq!(
+                contact("a@x.org", None, status.clone()).is_live(),
+                live,
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_uid_on_either_side_is_ignored() {
+        let audience = vec![contact("old@x.org", None, MemberStatus::Subscribed)];
+        let targets = vec![source("new@x.org", 1)];
+        assert_eq!(email_renames(&audience, &targets), vec![]);
+
+        let audience = vec![contact("old@x.org", Some(1), MemberStatus::Subscribed)];
+        let targets = vec![contact("new@x.org", None, MemberStatus::Noop)];
+        assert_eq!(email_renames(&audience, &targets), vec![]);
+    }
+
+    #[test]
+    fn rename_patch_carries_only_the_address() {
+        let patch = Member {
+            email_address: "new@x.org".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&patch).expect("serialize"),
+            serde_json::json!({"email_address": "new@x.org"})
+        );
+    }
+}
+
+#[cfg(test)]
+mod apply_renames_tests {
+    use super::*;
+
+    #[test]
+    fn landed_rename_rekeys_the_audience_entry() {
+        let mut audience = vec![
+            Member {
+                id: member_id("old@x.org"),
+                email_address: "old@x.org".into(),
+                ..Default::default()
+            },
+            Member {
+                id: member_id("other@x.org"),
+                email_address: "other@x.org".into(),
+                ..Default::default()
+            },
+        ];
+        apply_renames(
+            &mut audience,
+            &[EmailRename {
+                id: member_id("old@x.org"),
+                from: "old@x.org".into(),
+                to: "new@x.org".into(),
+            }],
+        );
+        assert_eq!(audience[0].id, member_id("new@x.org"));
+        assert_eq!(audience[0].email_address, "new@x.org");
+        assert_eq!(audience[1].email_address, "other@x.org");
+    }
+}
