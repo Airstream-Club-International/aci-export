@@ -26,12 +26,12 @@ impl Batch {
             .push(BatchOperation::new(BatchMethod::POST, path, json)?);
         Ok(self.operations.last_mut().unwrap())
     }
-    pub fn patch<'a, T>(&'a mut self, path: &str, json: &T) -> Result<&'a BatchOperation>
+    pub fn patch<'a, T>(&'a mut self, path: &str, json: &T) -> Result<&'a mut BatchOperation>
     where
         T: Serialize + ?Sized,
     {
         self.operations
-            .push(BatchOperation::new(BatchMethod::POST, path, json)?);
+            .push(BatchOperation::new(BatchMethod::PATCH, path, json)?);
         Ok(self.operations.last_mut().unwrap())
     }
 
@@ -131,3 +131,27 @@ pub struct BatchesResponse {
 query_default_impl!(BatchesQuery);
 paged_query_impl!(BatchesQuery, &[]);
 paged_response_impl!(BatchesResponse, batches, BatchInfo);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_builder_sets_its_own_method() {
+        let mut batch = Batch::default();
+        batch.post("/p", &()).expect("post");
+        batch.patch("/p", &()).expect("patch");
+        batch.put("/p", &()).expect("put");
+        batch.delete("/p", &()).expect("delete");
+        let methods: Vec<&BatchMethod> = batch.operations.iter().map(|op| &op.method).collect();
+        assert_eq!(
+            methods,
+            [
+                &BatchMethod::POST,
+                &BatchMethod::PATCH,
+                &BatchMethod::PUT,
+                &BatchMethod::DELETE
+            ]
+        );
+    }
+}

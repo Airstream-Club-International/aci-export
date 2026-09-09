@@ -3,6 +3,7 @@ use crate::{Result, settings::Settings};
 pub mod create;
 pub mod delete;
 pub mod fields;
+pub mod interests;
 pub mod list;
 pub mod migrate;
 pub mod run;
@@ -32,6 +33,7 @@ pub enum SyncCmd {
     Update(update::Cmd),
     Delete(delete::Cmd),
     Fields(fields::Cmd),
+    Interests(interests::Cmd),
     Run(run::Cmd),
     Migrate(migrate::Cmd),
 }
@@ -44,6 +46,7 @@ impl SyncCmd {
             Self::Update(cmd) => cmd.run(settings).await,
             Self::Delete(cmd) => cmd.run(settings).await,
             Self::Fields(cmd) => cmd.run(settings).await,
+            Self::Interests(cmd) => cmd.run(settings).await,
             Self::Run(cmd) => cmd.run(settings).await,
             Self::Migrate(cmd) => cmd.run(settings).await,
         }

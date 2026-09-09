@@ -3,7 +3,8 @@ use chrono::{DateTime, Utc};
 use futures::TryFutureExt;
 use mailchimp::{
     RetryPolicy,
-    members::{MembersQuery, member_id},
+    interests::Interests,
+    members::{EmailRename, MembersQuery, member_id},
 };
 use sqlx::{Database, Encode, MySqlPool, PgPool, Type, query::QueryAs};
 use std::{collections::HashSet, time::Instant};
@@ -11,15 +12,21 @@ use std::{collections::HashSet, time::Instant};
 #[derive(Debug, serde::Serialize)]
 pub struct JobSyncResult {
     pub name: String,
+    pub renamed: usize,
     pub archived: usize,
     pub resubscribed: usize,
     pub upserted: usize,
+    /// Members new to the audience that received the default email
+    /// preferences. Zero when the job has no preference group configured
+    /// or the group does not exist on the audience yet.
+    pub defaulted: usize,
 }
 
 #[derive(Debug, serde::Serialize)]
 pub struct DryRunResult {
     pub name: String,
     pub upserted: usize,
+    pub would_rename: Vec<EmailRename>,
     pub would_resubscribe: Vec<DryRunEntry>,
     pub would_archive: Vec<DryRunEntry>,
 }
@@ -231,15 +238,7 @@ impl Job {
                     let name = job.name.clone();
                     let id = job.id;
                     match job.sync(ddb_settings).await {
-                        Ok((archived, resubscribed, upserted)) => Some((
-                            id,
-                            JobSyncResult {
-                                name,
-                                archived,
-                                resubscribed,
-                                upserted,
-                            },
-                        )),
+                        Ok(result) => Some((id, result)),
                         Err(e) => {
                             tracing::error!(job_id = id, job_name = name, "sync failed: {e}");
                             None
@@ -307,13 +306,24 @@ impl Job {
         Ok((db_members, mc_members))
     }
 
+    /// The email preference group this job maintains. Only the all-members
+    /// audience carries one; club and region audiences have none.
+    fn interests(&self) -> Result<Option<Interests>> {
+        if self.club.is_some() || self.region.is_some() {
+            return Ok(None);
+        }
+        Interests::all().map(Some).map_err(Error::from)
+    }
+
     /// Audience query used by `sync` and `dry_run`. We need `status` to skip
-    /// already-archived contacts in `retain`, and `tags` so we can tell
+    /// already-archived contacts in `retain`, `tags` so we can tell
     /// sync-archived (safe to resubscribe) from admin-archived (must remain
-    /// archived) when a previously-archived member reappears in the source.
+    /// archived) when a previously-archived member reappears in the source,
+    /// and the `UID` merge field to pair a contact with its source member
+    /// when the email address differs.
     fn audience_query() -> MembersQuery {
         MembersQuery {
-            fields: "members.id,members.email_address,members.status,members.tags".to_string(),
+            fields: "members.id,members.email_address,members.status,members.tags,members.merge_fields.UID".to_string(),
             ..Default::default()
         }
     }
@@ -336,7 +346,7 @@ impl Job {
     }
 
     #[tracing::instrument(skip_all, name = "sync", fields(name = self.name, id = self.id))]
-    pub async fn sync(&self, ddb_url: AciDatabaseSettings) -> Result<(usize, usize, usize)> {
+    pub async fn sync(&self, ddb_url: AciDatabaseSettings) -> Result<JobSyncResult> {
         let db = ddb_url.connect().await?;
         let client = self.client()?;
         tracing::info!("starting sync");
@@ -346,12 +356,49 @@ impl Job {
         // Run the Drupal prep and the MailChimp audience fetch in parallel; we
         // need both before we can upsert (the audience tells us which members
         // are sync-archived and need their status explicitly restored).
-        let (prep, audience) = tokio::try_join!(self.prepare_mc_members(&db), async {
+        let (prep, mut audience) = tokio::try_join!(self.prepare_mc_members(&db), async {
             mailchimp::members::all_collect(&client, &self.list, Self::audience_query())
                 .await
                 .map_err(anyhow::Error::from)
         })?;
         let (db_members, mut mc_members) = prep;
+
+        // Contacts whose address changed on either side keep their record
+        // (and their preferences) by being renamed before the upsert, rather
+        // than recreated under the new address and archived under the old.
+        let renames = mailchimp::members::email_renames(&audience, &mc_members);
+        tracing::debug!(count = renames.len(), "renaming members");
+        let renamed = mailchimp::members::rename_many(
+            &client,
+            &self.list,
+            &renames,
+            RetryPolicy::with_retries(3),
+        )
+        .await?;
+        mailchimp::members::apply_renames(&mut audience, &renamed);
+
+        // Members new to the audience start with every email preference on.
+        // Existing contacts are never touched here: their preferences are
+        // theirs to set on the hosted preferences page.
+        let mut defaulted = 0;
+        if let Some(interests) = self.interests()? {
+            match interests.resolve(&client, &self.list).await? {
+                Some(resolved) => {
+                    let audience_ids: HashSet<&str> =
+                        audience.iter().map(|m| m.id.as_str()).collect();
+                    for member in &mut mc_members {
+                        if !audience_ids.contains(member.id.as_str()) {
+                            member.interests = Some(resolved.all_on());
+                            defaulted += 1;
+                        }
+                    }
+                }
+                None => tracing::warn!(
+                    category = interests.category.title,
+                    "preference group not on audience; new members get no defaults"
+                ),
+            }
+        }
 
         // For any member returning from a sync-driven archive, set status =
         // Subscribed on the PUT so MailChimp lifts the archive. Other members
@@ -390,15 +437,25 @@ impl Job {
         .await?;
 
         let duration = start.elapsed().as_secs();
+        let renamed = renamed.len();
         tracing::info!(
+            renamed,
             archived,
             resubscribed,
             upserted = upserted.len(),
+            defaulted,
             duration,
             "sync completed"
         );
 
-        Ok((archived, resubscribed, upserted.len()))
+        Ok(JobSyncResult {
+            name: self.name.clone(),
+            renamed,
+            archived,
+            resubscribed,
+            upserted: upserted.len(),
+            defaulted,
+        })
     }
 
     /// Compute what `sync()` would archive and resubscribe in MailChimp,
@@ -418,6 +475,12 @@ impl Job {
                 .map_err(anyhow::Error::from)
         })?;
         let (_db_members, mc_members) = prep;
+
+        // Renames happen before the upsert and change the audience's view of
+        // the renamed contacts; mirror that so the archive set matches sync().
+        let would_rename = mailchimp::members::email_renames(&audience, &mc_members);
+        let mut audience = audience;
+        mailchimp::members::apply_renames(&mut audience, &would_rename);
 
         // Mirror what upsert_many would produce: the hash of each emitted email.
         // (to_members already filters via is_valid_email at the source.)
@@ -457,8 +520,67 @@ impl Job {
         Ok(DryRunResult {
             name: self.name.clone(),
             upserted: upserted.len(),
+            would_rename,
             would_resubscribe,
             would_archive,
         })
+    }
+
+    /// Create the job's email preference group and interests on the
+    /// audience if they are missing. Returns the resolved ids and the names
+    /// of the interests created this call.
+    #[tracing::instrument(skip_all, name = "interests", fields(name = self.name, id = self.id))]
+    pub async fn sync_interests(
+        &self,
+    ) -> Result<Option<(mailchimp::interests::Resolved, Vec<String>)>> {
+        let Some(interests) = self.interests()? else {
+            return Ok(None);
+        };
+        let client = self.client()?;
+        interests
+            .sync(&client, &self.list)
+            .map_ok(Some)
+            .map_err(Error::from)
+            .await
+    }
+
+    /// Switch every configured interest on for every contact in the
+    /// audience that is not archived or cleaned. A one-time step when the
+    /// group is first introduced; after that only new members are
+    /// defaulted, by `sync`.
+    ///
+    /// Returns the number of contacts updated, or `None` when the job has no
+    /// preference group or the group does not exist on the audience.
+    #[tracing::instrument(skip_all, name = "seed_interests", fields(name = self.name, id = self.id))]
+    pub async fn seed_interests(&self) -> Result<Option<usize>> {
+        let Some(interests) = self.interests()? else {
+            return Ok(None);
+        };
+        let client = self.client()?;
+        let Some(resolved) = interests.resolve(&client, &self.list).await? else {
+            return Ok(None);
+        };
+        let audience =
+            mailchimp::members::all_collect(&client, &self.list, Self::audience_query()).await?;
+        let member_ids: Vec<String> = audience
+            .into_iter()
+            .filter(|m| {
+                !matches!(
+                    m.status,
+                    Some(mailchimp::members::MemberStatus::Cleaned)
+                        | Some(mailchimp::members::MemberStatus::Archived)
+                )
+            })
+            .map(|m| m.id)
+            .collect();
+        mailchimp::interests::update_many(
+            &client,
+            &self.list,
+            &member_ids,
+            &resolved.all_on(),
+            RetryPolicy::with_retries(3),
+        )
+        .await?;
+        Ok(Some(member_ids.len()))
     }
 }
