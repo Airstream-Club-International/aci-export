@@ -35,23 +35,29 @@ async fn job(settings: &Settings, id: u64) -> Result<Job> {
         .ok_or_else(|| anyhow::anyhow!("sync job not found"))
 }
 
-/// Create the preference group and any missing interests on the audience.
+/// Bring the preference group on the audience in line with the config.
+///
+/// Creates the group and any missing interests, and renames interests whose
+/// configured `was` names match. Interests the config does not name are
+/// reported as `extra` and left alone unless `--process-deletes` is given.
 ///
 /// MailChimp shows a group on the audience's hosted forms as soon as it
-/// exists, so run this when the preferences page is ready to go live, and
-/// follow it with `seed` so existing members start opted in. Interests on
-/// the audience that the config does not name are reported as `extra` and
-/// left alone.
+/// exists, so the first run is a launch step; follow it with `seed` so
+/// existing members start opted in.
 #[derive(Debug, clap::Args)]
 pub struct Sync {
     /// The id of the sync job
     id: u64,
+    /// Delete interests the config does not name, and every member's
+    /// setting for them
+    #[arg(long)]
+    process_deletes: bool,
 }
 
 impl Sync {
     pub async fn run(&self, settings: Settings) -> Result {
         let job = job(&settings, self.id).await?;
-        match job.sync_interests().await? {
+        match job.sync_interests(self.process_deletes).await? {
             Some(synced) => print_json(&synced),
             None => anyhow::bail!("job {} has no preference group configured", job.name),
         }

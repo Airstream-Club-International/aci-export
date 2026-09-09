@@ -84,13 +84,14 @@ Changing the list:
   (creates it on the audience), then `sync-mail interests seed 1 --interest
   "<name>"` so existing members are opted in without their other choices being
   reset. Campaigns for it need a saved segment.
-- **Rename an interest.** Rename it in the MailChimp UI and in the toml in the
-  same change. Matching is by name: with only one side renamed, the member
-  sync logs "preference group is missing an interest" and skips defaulting,
-  and `interests sync` would create the new name beside the old one.
-- **Remove an interest.** Remove it from the toml and delete it in the
-  MailChimp UI. `interests sync` never deletes; until the UI side is done it
-  reports the interest as `extra`.
+- **Rename an interest.** Change `name` in the toml and list the old name
+  under `was`, then run `sync-mail interests sync 1`. The interest is renamed
+  in place and members' settings for it are kept. Renaming only in the
+  MailChimp UI leaves the member sync unable to match it: it logs "preference
+  group is missing an interest" and skips defaulting until the toml catches up.
+- **Remove an interest.** Remove it from the toml and run `sync-mail interests
+  sync 1 --process-deletes`. Without the flag the interest is reported as
+  `extra` and left alone. Deleting it drops every member's setting for it.
 
 Never run `interests seed` without `--interest` once the page is live: that
 form opts everyone into everything.

@@ -102,6 +102,43 @@ async fn create_interest(
         .await
 }
 
+async fn update_interest(
+    client: &Client,
+    list_id: &str,
+    category_id: &str,
+    interest: &Interest,
+) -> Result<Interest> {
+    #[derive(Serialize)]
+    struct Patch<'a> {
+        name: &'a str,
+    }
+    client
+        .patch(
+            &format!(
+                "/3.0/lists/{list_id}/interest-categories/{category_id}/interests/{}",
+                interest.id
+            ),
+            &Patch {
+                name: &interest.name,
+            },
+        )
+        .await
+}
+
+/// Deleting an interest also drops every member's setting for it.
+async fn delete_interest(
+    client: &Client,
+    list_id: &str,
+    category_id: &str,
+    interest_id: &str,
+) -> Result<()> {
+    client
+        .delete(&format!(
+            "/3.0/lists/{list_id}/interest-categories/{category_id}/interests/{interest_id}"
+        ))
+        .await
+}
+
 /// The configured shape of one category and its interests.
 #[derive(Deserialize, Debug, Clone)]
 pub struct Interests {
@@ -119,6 +156,12 @@ pub struct CategoryConfig {
 #[derive(Deserialize, Debug, Clone)]
 pub struct InterestConfig {
     pub name: String,
+    /// Earlier names of this interest. When no interest carries `name`
+    /// but one carries a name listed here, `sync` renames it in place, so
+    /// members' settings for it are kept. Safe to leave in place once the
+    /// rename has been applied.
+    #[serde(default)]
+    pub was: Vec<String>,
 }
 
 impl Interests {
@@ -187,9 +230,17 @@ impl Interests {
             .collect()
     }
 
-    /// Create the category and any missing interests, in configured order.
-    /// Existing ones are matched by title and name and left alone.
-    pub async fn sync(&self, client: &Client, list_id: &str) -> Result<Synced> {
+    /// Bring the audience's category in line with the config: create it
+    /// and any missing interests in configured order, rename interests
+    /// whose configured `was` names match, and, with `process_deletes`,
+    /// delete interests the config does not name. Without it those are
+    /// only reported as `extra`.
+    pub async fn sync(
+        &self,
+        client: &Client,
+        list_id: &str,
+        process_deletes: bool,
+    ) -> Result<Synced> {
         let category = match categories(client, list_id)
             .await?
             .into_iter()
@@ -212,8 +263,19 @@ impl Interests {
 
         let mut existing = interests(client, list_id, &category.id).await?;
         let mut created = vec![];
+        let mut renamed = vec![];
         for (order, wanted) in self.interests.iter().enumerate() {
             if existing.iter().any(|i| i.name == wanted.name) {
+                continue;
+            }
+            let source = existing
+                .iter()
+                .position(|i| self.rename_target(&i.name, &existing) == Some(wanted.name.as_str()));
+            if let Some(index) = source {
+                let old = &mut existing[index];
+                renamed.push((old.name.clone(), wanted.name.clone()));
+                old.name = wanted.name.clone();
+                update_interest(client, list_id, &category.id, old).await?;
                 continue;
             }
             created.push(wanted.name.clone());
@@ -230,11 +292,36 @@ impl Interests {
             .await?;
             existing.push(interest);
         }
+        let mut extra = self.extra_in(&existing);
+        let mut deleted = vec![];
+        if process_deletes {
+            let (to_delete, kept): (Vec<Interest>, Vec<Interest>) =
+                existing.into_iter().partition(|i| extra.contains(&i.name));
+            existing = kept;
+            extra.clear();
+            for interest in to_delete {
+                delete_interest(client, list_id, &category.id, &interest.id).await?;
+                deleted.push(interest.name);
+            }
+        }
         Ok(Synced {
             resolved: self.resolved_in(category.id, &existing)?,
             created,
-            extra: self.extra_in(&existing),
+            renamed,
+            deleted,
+            extra,
         })
+    }
+
+    /// Which configured interest, if any, an existing interest with `name`
+    /// should be renamed to: the first configured interest that lists the
+    /// name under `was` and is not itself already present.
+    fn rename_target(&self, name: &str, existing: &[Interest]) -> Option<&str> {
+        self.interests
+            .iter()
+            .find(|wanted| wanted.was.iter().any(|was| was == name))
+            .filter(|wanted| !existing.iter().any(|i| i.name == wanted.name))
+            .map(|wanted| wanted.name.as_str())
     }
 }
 
@@ -244,7 +331,12 @@ pub struct Synced {
     pub resolved: Resolved,
     /// Names of the interests created by this call
     pub created: Vec<String>,
+    /// (old, new) names of the interests renamed by this call
+    pub renamed: Vec<(String, String)>,
+    /// Names of the interests deleted by this call
+    pub deleted: Vec<String>,
     /// Names of interests on the audience that the config does not name
+    /// and that were left in place
     pub extra: Vec<String>,
 }
 
@@ -393,6 +485,41 @@ mod tests {
             Err(Error::MissingInterest(name)) => assert_eq!(name, "Caravans"),
             other => panic!("expected MissingInterest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rename_target_follows_was_unless_the_new_name_already_exists() {
+        let config = Interests::from_config(config::File::from_str(
+            r#"
+            [category]
+            title = "Email Preferences"
+            [[interests]]
+            name = "Caravan Trips"
+            was = ["Caravans"]
+            [[interests]]
+            name = "Rallies"
+            "#,
+            config::FileFormat::Toml,
+        ))
+        .expect("parse");
+        let mut existing = vec![Interest {
+            id: "1".into(),
+            name: "Caravans".into(),
+            display_order: None,
+        }];
+        assert_eq!(
+            config.rename_target("Caravans", &existing),
+            Some("Caravan Trips")
+        );
+        assert_eq!(config.rename_target("Rallies", &existing), None);
+        existing.push(Interest {
+            id: "2".into(),
+            name: "Caravan Trips".into(),
+            display_order: None,
+        });
+        // Both names present: nothing to rename, the old one is extra.
+        assert_eq!(config.rename_target("Caravans", &existing), None);
+        assert_eq!(config.extra_in(&existing), ["Caravans"]);
     }
 
     #[test]

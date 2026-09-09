@@ -549,13 +549,16 @@ impl Job {
     /// audience if they are missing. Returns the resolved ids and the names
     /// of the interests created this call.
     #[tracing::instrument(skip_all, name = "interests", fields(name = self.name, id = self.id))]
-    pub async fn sync_interests(&self) -> Result<Option<mailchimp::interests::Synced>> {
+    pub async fn sync_interests(
+        &self,
+        process_deletes: bool,
+    ) -> Result<Option<mailchimp::interests::Synced>> {
         let Some(interests) = self.interests()? else {
             return Ok(None);
         };
         let client = self.client()?;
         interests
-            .sync(&client, &self.list)
+            .sync(&client, &self.list, process_deletes)
             .map_ok(Some)
             .map_err(Error::from)
             .await
