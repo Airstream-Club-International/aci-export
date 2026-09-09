@@ -219,6 +219,36 @@ impl Interests {
         })
     }
 
+    /// Configured interests that are not on the audience.
+    fn missing_in(&self, existing: &[Interest]) -> Vec<String> {
+        self.interests
+            .iter()
+            .filter(|wanted| !existing.iter().any(|i| i.name == wanted.name))
+            .map(|wanted| wanted.name.clone())
+            .collect()
+    }
+
+    /// Compare the audience to the config without changing anything.
+    pub async fn check(&self, client: &Client, list_id: &str) -> Result<Check> {
+        let Some(category) = categories(client, list_id)
+            .await?
+            .into_iter()
+            .find(|c| c.title == self.category.title)
+        else {
+            return Ok(Check {
+                category_present: false,
+                missing: self.interests.iter().map(|i| i.name.clone()).collect(),
+                extra: vec![],
+            });
+        };
+        let existing = interests(client, list_id, &category.id).await?;
+        Ok(Check {
+            category_present: true,
+            missing: self.missing_in(&existing),
+            extra: self.extra_in(&existing),
+        })
+    }
+
     /// Interests on the audience that the config does not name. They are
     /// never created or removed here; reporting them is how a rename made
     /// in the MailChimp UI, or an interest dropped from config, gets seen.
@@ -322,6 +352,22 @@ impl Interests {
             .find(|wanted| wanted.was.iter().any(|was| was == name))
             .filter(|wanted| !existing.iter().any(|i| i.name == wanted.name))
             .map(|wanted| wanted.name.as_str())
+    }
+}
+
+/// Outcome of [`Interests::check`]: how the audience differs from config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Check {
+    pub category_present: bool,
+    /// Configured interests not on the audience
+    pub missing: Vec<String>,
+    /// Interests on the audience the config does not name
+    pub extra: Vec<String>,
+}
+
+impl Check {
+    pub fn is_clean(&self) -> bool {
+        self.category_present && self.missing.is_empty() && self.extra.is_empty()
     }
 }
 
@@ -520,6 +566,46 @@ mod tests {
         // Both names present: nothing to rename, the old one is extra.
         assert_eq!(config.rename_target("Caravans", &existing), None);
         assert_eq!(config.extra_in(&existing), ["Caravans"]);
+    }
+
+    #[test]
+    fn missing_in_reports_configured_interests_not_on_the_audience() {
+        let config = Interests::all().expect("parse bundled config");
+        let mut existing = existing_for(&config);
+        assert_eq!(config.missing_in(&existing), Vec::<String>::new());
+        existing.remove(2);
+        assert_eq!(config.missing_in(&existing), ["Caravans"]);
+    }
+
+    #[test]
+    fn check_is_clean_only_with_category_and_no_differences() {
+        let clean = Check {
+            category_present: true,
+            missing: vec![],
+            extra: vec![],
+        };
+        assert!(clean.is_clean());
+        assert!(
+            !Check {
+                category_present: false,
+                ..clean.clone()
+            }
+            .is_clean()
+        );
+        assert!(
+            !Check {
+                missing: vec!["x".into()],
+                ..clean.clone()
+            }
+            .is_clean()
+        );
+        assert!(
+            !Check {
+                extra: vec!["x".into()],
+                ..clean.clone()
+            }
+            .is_clean()
+        );
     }
 
     #[test]

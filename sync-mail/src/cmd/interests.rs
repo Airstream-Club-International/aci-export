@@ -15,6 +15,7 @@ impl Cmd {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum InterestsCmd {
+    Check(Check),
     Sync(Sync),
     Seed(Seed),
 }
@@ -22,6 +23,7 @@ pub enum InterestsCmd {
 impl InterestsCmd {
     async fn run(&self, settings: Settings) -> Result {
         match self {
+            Self::Check(cmd) => cmd.run(settings).await,
             Self::Sync(cmd) => cmd.run(settings).await,
             Self::Seed(cmd) => cmd.run(settings).await,
         }
@@ -33,6 +35,41 @@ async fn job(settings: &Settings, id: u64) -> Result<Job> {
     Job::get(&db, id as i64)
         .await?
         .ok_or_else(|| anyhow::anyhow!("sync job not found"))
+}
+
+/// Compare the preference group on the audience to the config.
+///
+/// Changes nothing. Exits non-zero when the group is absent, a configured
+/// interest is missing, or the audience has an interest the config does not
+/// name, so a scheduled run of this surfaces edits made in the MailChimp UI.
+#[derive(Debug, clap::Args)]
+pub struct Check {
+    /// The id of the sync job
+    id: u64,
+}
+
+impl Check {
+    pub async fn run(&self, settings: Settings) -> Result {
+        let job = job(&settings, self.id).await?;
+        let Some(check) = job.check_interests().await? else {
+            anyhow::bail!("job {} has no preference group configured", job.name);
+        };
+        print_json(&check)?;
+        if check.is_clean() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "preference group on {} differs from config: missing {:?}, extra {:?}{}",
+            job.name,
+            check.missing,
+            check.extra,
+            if check.category_present {
+                ""
+            } else {
+                " (group not on audience)"
+            }
+        )
+    }
 }
 
 /// Bring the preference group on the audience in line with the config.

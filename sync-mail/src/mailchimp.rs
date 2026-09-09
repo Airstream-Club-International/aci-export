@@ -244,35 +244,46 @@ impl Job {
             .await
     }
 
-    /// Run sync for multiple jobs in parallel, returning results keyed by job ID
-    /// Jobs that fail are logged but don't stop other jobs from syncing
+    /// Run sync for multiple jobs in parallel. A job that fails does not
+    /// stop the others; its error is logged and returned alongside the
+    /// results so the caller can fail the run.
     pub async fn sync_many(
         jobs: Vec<Self>,
         ddb_settings: AciDatabaseSettings,
-    ) -> std::collections::HashMap<i64, JobSyncResult> {
+    ) -> (
+        std::collections::HashMap<i64, JobSyncResult>,
+        Vec<(String, Error)>,
+    ) {
         use futures::StreamExt;
 
-        futures::stream::iter(jobs)
+        let outcomes: Vec<_> = futures::stream::iter(jobs)
             .map(|job| {
                 let ddb_settings = ddb_settings.clone();
                 async move {
                     let name = job.name.clone();
                     let id = job.id;
-                    match job.sync(ddb_settings).await {
-                        Ok(result) => Some((id, result)),
-                        Err(e) => {
-                            tracing::error!(job_id = id, job_name = name, "sync failed: {e}");
-                            None
-                        }
+                    let outcome = job.sync(ddb_settings).await;
+                    if let Err(e) = &outcome {
+                        tracing::error!(job_id = id, job_name = name, "sync failed: {e:#}");
                     }
+                    (id, name, outcome)
                 }
             })
             .buffered(20)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .flatten()
             .collect()
+            .await;
+
+        let mut results = std::collections::HashMap::new();
+        let mut failures = vec![];
+        for (id, name, outcome) in outcomes {
+            match outcome {
+                Ok(result) => {
+                    results.insert(id, result);
+                }
+                Err(e) => failures.push((name, e)),
+            }
+        }
+        (results, failures)
     }
 
     /// Run dry_run for multiple jobs in parallel, returning results keyed by job ID
@@ -354,9 +365,11 @@ impl Job {
     }
 
     /// Resolve the job's preference group on the audience, or `None` when
-    /// the job has none, the group is not on the audience yet, or the group
-    /// is missing a configured interest. The member sync must keep running
-    /// in every one of those cases; it only forgoes defaulting, and says so.
+    /// the job has none or the group is not on the audience yet (the state
+    /// before launch, so new members simply get no defaults). A group that
+    /// exists but is missing a configured interest, which is what a rename
+    /// in the MailChimp UI looks like, is an error: the sync stops before
+    /// writing anything, so the run fails where it is watched.
     async fn resolved_interests(&self, client: &mailchimp::Client) -> Result<Option<Resolved>> {
         let Some(interests) = self.interests()? else {
             return Ok(None);
@@ -371,15 +384,32 @@ impl Job {
                 Ok(None)
             }
             Err(mailchimp::Error::MissingInterest(name)) => {
-                tracing::warn!(
+                tracing::error!(
                     category = interests.category.title,
                     interest = name,
-                    "preference group is missing an interest; new members get no defaults"
+                    "preference group is missing a configured interest; refusing to sync"
                 );
-                Ok(None)
+                Err(anyhow::anyhow!(
+                    "preference group {:?} is missing interest {name:?}; fix it in MailChimp or in the config, then re-run",
+                    interests.category.title
+                ))
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// Compare the audience's preference group to the config without
+    /// changing anything.
+    pub async fn check_interests(&self) -> Result<Option<mailchimp::interests::Check>> {
+        let Some(interests) = self.interests()? else {
+            return Ok(None);
+        };
+        let client = self.client()?;
+        interests
+            .check(&client, &self.list)
+            .map_ok(Some)
+            .map_err(Error::from)
+            .await
     }
 
     #[tracing::instrument(skip_all, name = "sync", fields(name = self.name, id = self.id))]

@@ -95,3 +95,10 @@ Changing the list:
 
 Never run `interests seed` without `--interest` once the page is live: that
 form opts everyone into everything.
+
+Edits made to the group in the MailChimp UI are the failure to watch for.
+The member sync refuses to run, before writing anything, when a configured
+interest is missing from the audience, so the scheduled run fails and the
+error names the interest. `sync-mail interests check 1` compares the audience
+to the config without changing anything and exits non-zero on any difference,
+including interests added in the UI; schedule it alongside the sync.
