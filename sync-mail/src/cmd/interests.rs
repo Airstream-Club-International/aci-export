@@ -16,6 +16,7 @@ impl Cmd {
 #[derive(Debug, clap::Subcommand)]
 pub enum InterestsCmd {
     Check(Check),
+    Status(Status),
     Sync(Sync),
     Seed(Seed),
 }
@@ -24,6 +25,7 @@ impl InterestsCmd {
     async fn run(&self, settings: Settings) -> Result {
         match self {
             Self::Check(cmd) => cmd.run(settings).await,
+            Self::Status(cmd) => cmd.run(settings).await,
             Self::Sync(cmd) => cmd.run(settings).await,
             Self::Seed(cmd) => cmd.run(settings).await,
         }
@@ -69,6 +71,26 @@ impl Check {
                 " (group not on audience)"
             }
         )
+    }
+}
+
+/// Show how many members hold each interest of the preference group.
+#[derive(Debug, clap::Args)]
+pub struct Status {
+    /// The id of the sync job
+    id: u64,
+}
+
+impl Status {
+    pub async fn run(&self, settings: Settings) -> Result {
+        let job = job(&settings, self.id).await?;
+        match job.interest_status().await? {
+            Some(status) => print_json(&status),
+            None => anyhow::bail!(
+                "job {} has no preference group configured, or it is not on the audience yet",
+                job.name
+            ),
+        }
     }
 }
 

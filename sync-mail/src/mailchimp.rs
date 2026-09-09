@@ -39,6 +39,25 @@ pub struct DryRunResult {
 }
 
 #[derive(Debug, serde::Serialize)]
+pub struct InterestStatus {
+    pub category: String,
+    /// Subscribed members of the audience, MailChimp's `member_count`
+    pub subscribed: u64,
+    pub interests: Vec<InterestCount>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct InterestCount {
+    pub name: String,
+    /// Members with the interest on, as MailChimp counts them
+    pub holding: u64,
+    /// `subscribed` less `holding`; an approximation, since MailChimp's
+    /// per-interest count and the audience count are not taken from the
+    /// same population at the same instant
+    pub opted_out: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
 pub struct DryRunEntry {
     pub id: String,
     pub email_address: String,
@@ -404,6 +423,37 @@ impl Job {
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// Each configured interest with the number of members holding it,
+    /// beside the audience's subscribed member count, or `None` when the
+    /// job has no preference group or the group is not on the audience.
+    pub async fn interest_status(&self) -> Result<Option<InterestStatus>> {
+        let Some(interests) = self.interests()? else {
+            return Ok(None);
+        };
+        let client = self.client()?;
+        let (resolved, list) = tokio::try_join!(
+            interests.resolve(&client, &self.list),
+            mailchimp::lists::get(&client, &self.list)
+        )?;
+        let Some(resolved) = resolved else {
+            return Ok(None);
+        };
+        let subscribed = list.stats.map(|s| s.member_count).unwrap_or_default();
+        Ok(Some(InterestStatus {
+            category: interests.category.title,
+            subscribed,
+            interests: resolved
+                .interests
+                .into_iter()
+                .map(|i| InterestCount {
+                    opted_out: subscribed.saturating_sub(i.subscribers),
+                    name: i.name,
+                    holding: i.subscribers,
+                })
+                .collect(),
+        }))
     }
 
     /// Compare the audience's preference group to the config without
