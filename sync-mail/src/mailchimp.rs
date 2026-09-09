@@ -354,19 +354,32 @@ impl Job {
     }
 
     /// Resolve the job's preference group on the audience, or `None` when
-    /// the job has none or the group is not on the audience yet.
+    /// the job has none, the group is not on the audience yet, or the group
+    /// is missing a configured interest. The member sync must keep running
+    /// in every one of those cases; it only forgoes defaulting, and says so.
     async fn resolved_interests(&self, client: &mailchimp::Client) -> Result<Option<Resolved>> {
         let Some(interests) = self.interests()? else {
             return Ok(None);
         };
-        let resolved = interests.resolve(client, &self.list).await?;
-        if resolved.is_none() {
-            tracing::warn!(
-                category = interests.category.title,
-                "preference group not on audience; new members get no defaults"
-            );
+        match interests.resolve(client, &self.list).await {
+            Ok(Some(resolved)) => Ok(Some(resolved)),
+            Ok(None) => {
+                tracing::warn!(
+                    category = interests.category.title,
+                    "preference group not on audience; new members get no defaults"
+                );
+                Ok(None)
+            }
+            Err(mailchimp::Error::MissingInterest(name)) => {
+                tracing::warn!(
+                    category = interests.category.title,
+                    interest = name,
+                    "preference group is missing an interest; new members get no defaults"
+                );
+                Ok(None)
+            }
+            Err(err) => Err(err.into()),
         }
-        Ok(resolved)
     }
 
     #[tracing::instrument(skip_all, name = "sync", fields(name = self.name, id = self.id))]
@@ -611,9 +624,10 @@ fn withhold_failed_renames(
 /// contact is left untouched: their preferences are theirs to set on the
 /// hosted preferences page.
 ///
-/// Returning members get the defaults because the contact may have been
-/// archived before the group existed or before it was seeded, in which
-/// case it would come back live with every preference off.
+/// A returning member is treated as a new one: every member is opted in
+/// on joining, and choices made before a lapse are not carried over. It
+/// also covers a contact archived before the group existed or was seeded,
+/// which would otherwise come back live with every preference off.
 fn default_interests(
     mc_members: &mut [Member],
     audience_ids: &HashSet<String>,

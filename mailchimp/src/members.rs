@@ -330,9 +330,14 @@ pub async fn rename_many(
                 let landed = match result {
                     Ok(_) => true,
                     Err(err) => {
-                        let landed = for_id(&client, list_id, &member_id(&rename.to))
-                            .await
-                            .is_ok();
+                        // A 404 on the old id is what a PATCH that landed
+                        // without a response looks like on retry; any other
+                        // error is a refusal.
+                        let is_gone = matches!(&err, Error::Mailchimp(e) if e.status == 404);
+                        let landed = is_gone
+                            && for_id(&client, list_id, &member_id(&rename.to))
+                                .await
+                                .is_ok();
                         if !landed {
                             tracing::warn!(
                                 id = rename.id,
