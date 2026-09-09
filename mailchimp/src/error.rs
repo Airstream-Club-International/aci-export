@@ -21,6 +21,8 @@ pub enum Error {
     InvalidMergeType(String),
     #[error("invalid merge field: {0}")]
     InvalidMergeField(String),
+    #[error("interest not on audience: {0}")]
+    MissingInterest(String),
     #[error("config: {0}")]
     Config(#[from] config::ConfigError),
     #[error("batch {batch_id} had {errored} of {total} operations fail")]
@@ -60,10 +62,12 @@ impl Error {
     /// Returns true if this error is transient and the operation should be retried
     pub fn is_retryable(&self) -> bool {
         match self {
+            // 400 Bad Request - MailChimp refused the payload, resending it
+            // changes nothing (invalid or already-taken email, bad field)
             // 401 Unauthorized - invalid API key, don't retry
             // 403 Forbidden - don't retry
             // 404 Not Found - don't retry
-            Self::Mailchimp(err) if matches!(err.status, 401 | 403 | 404) => false,
+            Self::Mailchimp(err) if matches!(err.status, 400 | 401 | 403 | 404) => false,
             // Malformed API key - don't retry
             Self::MalformedAPIKey => false,
             // Other mailchimp errors (rate limits, server errors) - retry
@@ -81,6 +85,31 @@ impl Error {
             tokio_retry2::RetryError::transient(self)
         } else {
             tokio_retry2::RetryError::permanent(self)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mailchimp(status: u16) -> Error {
+        Error::Mailchimp(MailchimError {
+            status,
+            r#type: None,
+            title: String::new(),
+            detail: String::new(),
+            instance: String::new(),
+        })
+    }
+
+    #[test]
+    fn client_rejections_are_permanent_and_the_rest_retry() {
+        for status in [400, 401, 403, 404] {
+            assert!(!mailchimp(status).is_retryable(), "{status}");
+        }
+        for status in [429, 500, 503] {
+            assert!(mailchimp(status).is_retryable(), "{status}");
         }
     }
 }

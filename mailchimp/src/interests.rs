@@ -55,7 +55,7 @@ struct InterestsResponse {
     interests: Vec<Interest>,
 }
 
-pub async fn categories(client: &Client, list_id: &str) -> Result<Vec<InterestCategory>> {
+async fn categories(client: &Client, list_id: &str) -> Result<Vec<InterestCategory>> {
     let response: CategoriesResponse = client
         .fetch(
             &format!("/3.0/lists/{list_id}/interest-categories"),
@@ -65,7 +65,7 @@ pub async fn categories(client: &Client, list_id: &str) -> Result<Vec<InterestCa
     Ok(response.categories)
 }
 
-pub async fn create_category(
+async fn create_category(
     client: &Client,
     list_id: &str,
     category: &InterestCategory,
@@ -78,7 +78,7 @@ pub async fn create_category(
         .await
 }
 
-pub async fn interests(client: &Client, list_id: &str, category_id: &str) -> Result<Vec<Interest>> {
+async fn interests(client: &Client, list_id: &str, category_id: &str) -> Result<Vec<Interest>> {
     let response: InterestsResponse = client
         .fetch(
             &format!("/3.0/lists/{list_id}/interest-categories/{category_id}/interests"),
@@ -88,7 +88,7 @@ pub async fn interests(client: &Client, list_id: &str, category_id: &str) -> Res
     Ok(response.interests)
 }
 
-pub async fn create_interest(
+async fn create_interest(
     client: &Client,
     list_id: &str,
     category_id: &str,
@@ -122,7 +122,7 @@ pub struct InterestConfig {
 }
 
 impl Interests {
-    pub fn from_config<S>(source: S) -> Result<Self>
+    fn from_config<S>(source: S) -> Result<Self>
     where
         S: config::Source + Send + Sync + 'static,
     {
@@ -136,7 +136,10 @@ impl Interests {
     }
 
     /// Look up the configured category and interests on the audience without
-    /// creating anything. `None` when the category does not exist yet.
+    /// creating anything. `None` when the category does not exist yet; an
+    /// error when the category exists but any configured interest is
+    /// missing from it, since defaulting members into a partial group would
+    /// silently leave them out of the rest.
     pub async fn resolve(&self, client: &Client, list_id: &str) -> Result<Option<Resolved>> {
         let Some(category) = categories(client, list_id)
             .await?
@@ -146,16 +149,26 @@ impl Interests {
             return Ok(None);
         };
         let existing = interests(client, list_id, &category.id).await?;
-        let ids = self
-            .interests
-            .iter()
-            .filter_map(|wanted| existing.iter().find(|i| i.name == wanted.name))
-            .map(|i| i.id.clone())
-            .collect();
         Ok(Some(Resolved {
             category_id: category.id,
-            ids,
+            ids: self.ids_in(&existing)?,
         }))
+    }
+
+    /// The id of each configured interest, in configured order, from the
+    /// interests that exist on the audience. Errors on the first configured
+    /// interest that is not there.
+    fn ids_in(&self, existing: &[Interest]) -> Result<Vec<String>> {
+        self.interests
+            .iter()
+            .map(|wanted| {
+                existing
+                    .iter()
+                    .find(|i| i.name == wanted.name)
+                    .map(|i| i.id.clone())
+                    .ok_or_else(|| Error::MissingInterest(wanted.name.clone()))
+            })
+            .collect()
     }
 
     /// Create the category and any missing interests, in configured order.
@@ -196,9 +209,9 @@ impl Interests {
                         list_id,
                         &category.id,
                         &Interest {
+                            id: String::new(),
                             name: wanted.name.clone(),
                             display_order: Some(order as u32 + 1),
-                            ..Default::default()
                         },
                     )
                     .await?
@@ -303,6 +316,30 @@ mod tests {
                 "Club Business (Governance)",
             ]
         );
+    }
+
+    #[test]
+    fn ids_in_requires_every_configured_interest() {
+        let config = Interests::all().expect("parse bundled config");
+        let mut existing: Vec<Interest> = config
+            .interests
+            .iter()
+            .enumerate()
+            .map(|(n, i)| Interest {
+                id: format!("id{n}"),
+                name: i.name.clone(),
+                display_order: None,
+            })
+            .collect();
+        let ids = config.ids_in(&existing).expect("all present");
+        assert_eq!(ids.len(), config.interests.len());
+        assert_eq!(ids[2], "id2");
+
+        existing.remove(2);
+        match config.ids_in(&existing) {
+            Err(Error::MissingInterest(name)) => assert_eq!(name, "Caravans"),
+            other => panic!("expected MissingInterest, got {other:?}"),
+        }
     }
 
     #[test]
