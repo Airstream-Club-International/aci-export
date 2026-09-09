@@ -18,6 +18,10 @@ pub struct Cmd {
     /// Skip the merge-fields sync that runs before the job is inserted
     #[arg(long)]
     skip_field_sync: bool,
+    /// Bundled interest config the audience carries (for example "aci");
+    /// omit for an audience with no preference group
+    #[arg(long)]
+    interests: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -47,6 +51,7 @@ impl Cmd {
             list: self.list.clone(),
             api_key: self.api_key.clone(),
             region: self.target.region,
+            interests: self.interests.clone(),
             ..Default::default()
         };
 

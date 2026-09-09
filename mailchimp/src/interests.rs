@@ -172,9 +172,13 @@ impl Interests {
         read_config(source)
     }
 
-    /// The email preference group for the all-members audience.
-    pub fn all() -> Result<Self> {
-        let str = include_str!("../data/interests-all.toml");
+    /// A bundled interest config by name. A job names the one its
+    /// audience carries; there is no config that applies to every audience.
+    pub fn named(name: &str) -> Result<Self> {
+        let str = match name {
+            "aci" => include_str!("../data/interests-aci.toml"),
+            _ => return Err(Error::UnknownInterests(name.to_string())),
+        };
         Self::from_config(config::File::from_str(str, config::FileFormat::Toml))
     }
 
@@ -483,8 +487,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_members_config_matches_the_board_spec_in_order() {
-        let config = Interests::all().expect("parse bundled config");
+    fn unknown_config_name_is_an_error() {
+        match Interests::named("bogus") {
+            Err(Error::UnknownInterests(name)) => assert_eq!(name, "bogus"),
+            other => panic!("expected UnknownInterests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aci_config_matches_the_board_spec_in_order() {
+        let config = Interests::named("aci").expect("parse bundled config");
         assert_eq!(config.category.title, "Email Preferences");
         assert_eq!(config.category.r#type, CategoryType::Checkboxes);
         let names: Vec<&str> = config.interests.iter().map(|i| i.name.as_str()).collect();
@@ -517,7 +529,7 @@ mod tests {
 
     #[test]
     fn resolved_in_requires_every_configured_interest() {
-        let config = Interests::all().expect("parse bundled config");
+        let config = Interests::named("aci").expect("parse bundled config");
         let mut existing = existing_for(&config);
         let resolved = config
             .resolved_in("cat".into(), &existing)
@@ -570,7 +582,7 @@ mod tests {
 
     #[test]
     fn missing_in_reports_configured_interests_not_on_the_audience() {
-        let config = Interests::all().expect("parse bundled config");
+        let config = Interests::named("aci").expect("parse bundled config");
         let mut existing = existing_for(&config);
         assert_eq!(config.missing_in(&existing), Vec::<String>::new());
         existing.remove(2);
@@ -610,7 +622,7 @@ mod tests {
 
     #[test]
     fn extra_in_reports_interests_the_config_does_not_name() {
-        let config = Interests::all().expect("parse bundled config");
+        let config = Interests::named("aci").expect("parse bundled config");
         let mut existing = existing_for(&config);
         assert_eq!(config.extra_in(&existing), Vec::<String>::new());
         existing.push(Interest {

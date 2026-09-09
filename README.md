@@ -71,12 +71,14 @@ Standard field names for query results:
 
 ## Email preferences on the all-members audience
 
-The all-members MailChimp audience carries an "Email Preferences" group, the
-checkboxes members see on the hosted preferences page linked from every
-campaign footer. Its shape lives in `mailchimp/data/interests-all.toml`, and
-`sync-mail interests` applies it. Every member is opted into every interest on
-joining; the member sync defaults new and returning members and never touches
-anyone else's choices.
+The ACI all-members MailChimp audience carries an "Email Preferences" group,
+the checkboxes members see on the hosted preferences page linked from every
+campaign footer. Its shape lives in `mailchimp/data/interests-aci.toml`. A
+group belongs to one audience: a job maintains it only when the job's
+`interests` setting names that config (`sync-mail update 1 --interests aci`),
+and a job with no setting has no group. `sync-mail interests` applies it.
+Every member is opted into every interest on joining; the member sync defaults
+new and returning members and never touches anyone else's choices.
 
 Changing the list:
 

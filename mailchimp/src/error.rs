@@ -23,6 +23,8 @@ pub enum Error {
     InvalidMergeField(String),
     #[error("interest not on audience: {0}")]
     MissingInterest(String),
+    #[error("no bundled interest config named {0:?}")]
+    UnknownInterests(String),
     #[error("config: {0}")]
     Config(#[from] config::ConfigError),
     #[error("batch {batch_id} had {errored} of {total} operations fail")]

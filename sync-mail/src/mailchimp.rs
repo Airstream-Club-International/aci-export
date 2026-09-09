@@ -53,6 +53,10 @@ pub struct Job {
     pub club: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<i32>,
+    /// Name of the bundled interest config this job maintains on its
+    /// audience, or none. See [`Interests::named`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interests: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -64,6 +68,7 @@ pub struct JobUpdate {
     pub list: Option<String>,
     pub club: Option<i64>,
     pub region: Option<i32>,
+    pub interests: Option<String>,
 }
 
 trait MaybeBind<'q, DB>
@@ -106,6 +111,7 @@ impl JobUpdate {
         maybe_setter(&self.list, "list", &mut index, &mut results);
         maybe_setter(&self.club, "club", &mut index, &mut results);
         maybe_setter(&self.region, "region", &mut index, &mut results);
+        maybe_setter(&self.interests, "interests", &mut index, &mut results);
         results
     }
 
@@ -125,20 +131,23 @@ impl JobUpdate {
             .maybe_bind(&self.list)
             .maybe_bind(&self.club)
             .maybe_bind(&self.region)
+            .maybe_bind(&self.interests)
     }
 }
 
 impl Job {
     pub async fn all(db: &PgPool) -> Result<Vec<Self>> {
-        sqlx::query_as("select id, name, api_key, list, club, region, created_at from mailchimp")
-            .fetch_all(db)
-            .map_err(Error::from)
-            .await
+        sqlx::query_as(
+            "select id, name, api_key, list, club, region, interests, created_at from mailchimp",
+        )
+        .fetch_all(db)
+        .map_err(Error::from)
+        .await
     }
 
     pub async fn get(db: &PgPool, job_id: i64) -> Result<Option<Self>> {
         sqlx::query_as(
-            r#"select id, name, api_key, list, club, region, created_at from mailchimp where id = $1;"#,
+            r#"select id, name, api_key, list, club, region, interests, created_at from mailchimp where id = $1;"#,
         )
         .bind(job_id)
         .fetch_optional(db)
@@ -149,8 +158,8 @@ impl Job {
     pub async fn create(db: &PgPool, job: &Self) -> Result<Self> {
         sqlx::query_as(
             r#"
-            insert into mailchimp (name, api_key, list, club, region)
-            values ($1, $2, $3, $4, $5)
+            insert into mailchimp (name, api_key, list, club, region, interests)
+            values ($1, $2, $3, $4, $5, $6)
             returning *;
             "#,
         )
@@ -159,6 +168,7 @@ impl Job {
         .bind(&job.list)
         .bind(job.club)
         .bind(job.region)
+        .bind(&job.interests)
         .fetch_one(db)
         .map_err(Error::from)
         .await
@@ -206,31 +216,26 @@ impl Job {
         Ok(db_members)
     }
 
-    fn kind(&self) -> AudienceKind {
-        if self.club.is_some() {
-            AudienceKind::Club
-        } else if self.region.is_some() {
-            AudienceKind::Region
-        } else {
-            AudienceKind::All
-        }
-    }
-
     fn merge_fields(&self) -> Result<MergeFields> {
-        match self.kind() {
-            AudienceKind::Club => MergeFields::club(),
-            AudienceKind::Region | AudienceKind::All => MergeFields::all(),
+        if self.club.is_some() {
+            MergeFields::club()
+        } else {
+            // region or all
+            MergeFields::all()
         }
         .map_err(Error::from)
     }
 
-    /// The email preference group this job maintains. Only the all-members
-    /// audience carries one; club and region audiences have none.
+    /// The preference group this job maintains on its audience: the bundled
+    /// config its `interests` setting names, or none. Each audience's group
+    /// is its own; nothing is implied by the job being a club, region or
+    /// all-members sync.
     fn interests(&self) -> Result<Option<Interests>> {
-        match self.kind() {
-            AudienceKind::All => Interests::all().map(Some).map_err(Error::from),
-            AudienceKind::Club | AudienceKind::Region => Ok(None),
-        }
+        self.interests
+            .as_deref()
+            .map(Interests::named)
+            .transpose()
+            .map_err(Error::from)
     }
 
     #[tracing::instrument(skip_all, name = "merge_fields", fields(name = self.name, id = self.id))]
@@ -634,15 +639,6 @@ impl Job {
     }
 }
 
-/// Which slice of the membership a job mirrors. Decides the merge field set
-/// and whether the audience carries the email preference group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AudienceKind {
-    All,
-    Club,
-    Region,
-}
-
 /// A refused rename leaves the contact under its old address. Its source
 /// member is withheld from the upsert so the new address is not created
 /// beside it, and the old contact id is returned for retain's keep set so it
@@ -739,21 +735,29 @@ mod tests {
     }
 
     #[test]
-    fn audience_kind_follows_club_then_region() {
-        let job = Job::default();
-        assert_eq!(job.kind(), AudienceKind::All);
-        let club = Job {
+    fn interests_follow_the_job_setting_not_its_kind() {
+        let none = Job::default();
+        assert!(none.interests().expect("no config").is_none());
+        let aci = Job {
+            interests: Some("aci".into()),
+            ..Default::default()
+        };
+        assert!(aci.interests().expect("bundled config").is_some());
+        let club_with_group = Job {
             club: Some(1),
+            interests: Some("aci".into()),
             ..Default::default()
         };
-        assert_eq!(club.kind(), AudienceKind::Club);
-        let region = Job {
-            region: Some(1),
+        assert!(
+            club_with_group
+                .interests()
+                .expect("bundled config")
+                .is_some()
+        );
+        let unknown = Job {
+            interests: Some("bogus".into()),
             ..Default::default()
         };
-        assert_eq!(region.kind(), AudienceKind::Region);
-        assert!(region.interests().expect("config").is_none());
-        assert!(club.interests().expect("config").is_none());
-        assert!(job.interests().expect("config").is_some());
+        assert!(unknown.interests().is_err());
     }
 }
