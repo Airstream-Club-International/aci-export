@@ -8,7 +8,10 @@ use mailchimp::{
     merge_fields::MergeFields,
 };
 use sqlx::{Database, Encode, MySqlPool, PgPool, Type, query::QueryAs};
-use std::{collections::HashSet, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 #[derive(Debug, serde::Serialize)]
 pub struct JobSyncResult {
@@ -608,7 +611,7 @@ impl Job {
     /// Returns the number of contacts updated, or `None` when the job has no
     /// preference group or the group does not exist on the audience.
     #[tracing::instrument(skip_all, name = "seed_interests", fields(name = self.name, id = self.id))]
-    pub async fn seed_interests(&self, only: &[String]) -> Result<Option<usize>> {
+    pub async fn seed_interests(&self, only: &[String], force: bool) -> Result<Option<usize>> {
         let Some(interests) = self.interests()? else {
             return Ok(None);
         };
@@ -616,11 +619,16 @@ impl Job {
         let Some(resolved) = interests.resolve(&client, &self.list).await? else {
             return Ok(None);
         };
-        let on = if only.is_empty() {
-            resolved.all_on()
-        } else {
-            resolved.on(only)?
-        };
+        let targets = resolved.named(only)?;
+        let held = mailchimp::interests::already_held(&targets);
+        if !held.is_empty() && !force {
+            anyhow::bail!(
+                "refusing to seed: members already hold {held:?}; seeding would opt back in \
+                 everyone who switched them off. Seed only an interest nobody holds yet, or \
+                 pass --force if that is really intended"
+            );
+        }
+        let on: HashMap<String, bool> = targets.iter().map(|i| (i.id.clone(), true)).collect();
         let audience = members::all_collect(&client, &self.list, Self::audience_query()).await?;
         let member_ids: Vec<String> = audience
             .into_iter()
@@ -696,6 +704,7 @@ mod tests {
             interests: vec![mailchimp::interests::ResolvedInterest {
                 name: "One".into(),
                 id: "i1".into(),
+                subscribers: 0,
             }],
         };
         let mut members = vec![

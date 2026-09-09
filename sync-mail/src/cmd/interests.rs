@@ -104,11 +104,12 @@ impl Sync {
 /// Opt every current contact into interests of the preference group.
 ///
 /// With no `--interest`, every configured interest is switched on: the
-/// one-time step after `sync` introduces the group. It overwrites any
-/// choice a member has already made on the preferences page, so do not
-/// run that form again once the page is live. With `--interest`, only the
-/// named interests are switched on and the rest are left as they are: how
-/// an interest added later reaches existing members.
+/// one-time step after `sync` introduces the group. With `--interest`,
+/// only the named interests are switched on and the rest are left as they
+/// are: how an interest added later reaches existing members.
+///
+/// Refuses to touch an interest any member already holds, since that would
+/// opt back in everyone who has switched it off. `--force` overrides.
 #[derive(Debug, clap::Args)]
 pub struct Seed {
     /// The id of the sync job
@@ -116,6 +117,9 @@ pub struct Seed {
     /// Switch on only this interest, by its configured name (repeatable)
     #[arg(long = "interest")]
     only: Vec<String>,
+    /// Seed even interests members already hold
+    #[arg(long)]
+    force: bool,
 }
 
 impl Seed {
@@ -125,7 +129,7 @@ impl Seed {
             seeded: usize,
         }
         let job = job(&settings, self.id).await?;
-        match job.seed_interests(&self.only).await? {
+        match job.seed_interests(&self.only, self.force).await? {
             Some(seeded) => print_json(&SeedResult { seeded }),
             None => anyhow::bail!(
                 "job {} has no preference group configured, or it is not on the audience yet (run `interests sync` first)",
