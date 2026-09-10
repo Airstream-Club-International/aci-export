@@ -8,7 +8,10 @@ use mailchimp::{
     merge_fields::MergeFields,
 };
 use sqlx::{Database, Encode, MySqlPool, PgPool, Type, query::QueryAs};
-use std::{collections::HashSet, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 #[derive(Debug, serde::Serialize)]
 pub struct JobSyncResult {
@@ -33,6 +36,25 @@ pub struct DryRunResult {
     pub would_rename: Vec<EmailRename>,
     pub would_resubscribe: Vec<DryRunEntry>,
     pub would_archive: Vec<DryRunEntry>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct InterestStatus {
+    pub category: String,
+    /// Subscribed members of the audience, MailChimp's `member_count`
+    pub subscribed: u64,
+    pub interests: Vec<InterestCount>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct InterestCount {
+    pub name: String,
+    /// Members with the interest on, as MailChimp counts them
+    pub holding: u64,
+    /// `subscribed` less `holding`; an approximation, since MailChimp's
+    /// per-interest count and the audience count are not taken from the
+    /// same population at the same instant
+    pub opted_out: u64,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -403,6 +425,37 @@ impl Job {
         }
     }
 
+    /// Each configured interest with the number of members holding it,
+    /// beside the audience's subscribed member count, or `None` when the
+    /// job has no preference group or the group is not on the audience.
+    pub async fn interest_status(&self) -> Result<Option<InterestStatus>> {
+        let Some(interests) = self.interests()? else {
+            return Ok(None);
+        };
+        let client = self.client()?;
+        let (resolved, list) = tokio::try_join!(
+            interests.resolve(&client, &self.list),
+            mailchimp::lists::get(&client, &self.list)
+        )?;
+        let Some(resolved) = resolved else {
+            return Ok(None);
+        };
+        let subscribed = list.stats.map(|s| s.member_count).unwrap_or_default();
+        Ok(Some(InterestStatus {
+            category: interests.category.title,
+            subscribed,
+            interests: resolved
+                .interests
+                .into_iter()
+                .map(|i| InterestCount {
+                    opted_out: subscribed.saturating_sub(i.subscribers),
+                    name: i.name,
+                    holding: i.subscribers,
+                })
+                .collect(),
+        }))
+    }
+
     /// Compare the audience's preference group to the config without
     /// changing anything.
     pub async fn check_interests(&self) -> Result<Option<mailchimp::interests::Check>> {
@@ -608,7 +661,7 @@ impl Job {
     /// Returns the number of contacts updated, or `None` when the job has no
     /// preference group or the group does not exist on the audience.
     #[tracing::instrument(skip_all, name = "seed_interests", fields(name = self.name, id = self.id))]
-    pub async fn seed_interests(&self, only: &[String]) -> Result<Option<usize>> {
+    pub async fn seed_interests(&self, only: &[String], force: bool) -> Result<Option<usize>> {
         let Some(interests) = self.interests()? else {
             return Ok(None);
         };
@@ -616,11 +669,16 @@ impl Job {
         let Some(resolved) = interests.resolve(&client, &self.list).await? else {
             return Ok(None);
         };
-        let on = if only.is_empty() {
-            resolved.all_on()
-        } else {
-            resolved.on(only)?
-        };
+        let targets = resolved.named(only)?;
+        let held = mailchimp::interests::already_held(&targets);
+        if !held.is_empty() && !force {
+            anyhow::bail!(
+                "refusing to seed: members already hold {held:?}; seeding would opt back in \
+                 everyone who switched them off. Seed only an interest nobody holds yet, or \
+                 pass --force if that is really intended"
+            );
+        }
+        let on: HashMap<String, bool> = targets.iter().map(|i| (i.id.clone(), true)).collect();
         let audience = members::all_collect(&client, &self.list, Self::audience_query()).await?;
         let member_ids: Vec<String> = audience
             .into_iter()
@@ -696,6 +754,7 @@ mod tests {
             interests: vec![mailchimp::interests::ResolvedInterest {
                 name: "One".into(),
                 id: "i1".into(),
+                subscribers: 0,
             }],
         };
         let mut members = vec![

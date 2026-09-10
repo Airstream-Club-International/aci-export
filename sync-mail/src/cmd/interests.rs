@@ -16,6 +16,7 @@ impl Cmd {
 #[derive(Debug, clap::Subcommand)]
 pub enum InterestsCmd {
     Check(Check),
+    Status(Status),
     Sync(Sync),
     Seed(Seed),
 }
@@ -24,6 +25,7 @@ impl InterestsCmd {
     async fn run(&self, settings: Settings) -> Result {
         match self {
             Self::Check(cmd) => cmd.run(settings).await,
+            Self::Status(cmd) => cmd.run(settings).await,
             Self::Sync(cmd) => cmd.run(settings).await,
             Self::Seed(cmd) => cmd.run(settings).await,
         }
@@ -72,6 +74,26 @@ impl Check {
     }
 }
 
+/// Show how many members hold each interest of the preference group.
+#[derive(Debug, clap::Args)]
+pub struct Status {
+    /// The id of the sync job
+    id: u64,
+}
+
+impl Status {
+    pub async fn run(&self, settings: Settings) -> Result {
+        let job = job(&settings, self.id).await?;
+        match job.interest_status().await? {
+            Some(status) => print_json(&status),
+            None => anyhow::bail!(
+                "job {} has no preference group configured, or it is not on the audience yet",
+                job.name
+            ),
+        }
+    }
+}
+
 /// Bring the preference group on the audience in line with the config.
 ///
 /// Creates the group and any missing interests, and renames interests whose
@@ -104,11 +126,12 @@ impl Sync {
 /// Opt every current contact into interests of the preference group.
 ///
 /// With no `--interest`, every configured interest is switched on: the
-/// one-time step after `sync` introduces the group. It overwrites any
-/// choice a member has already made on the preferences page, so do not
-/// run that form again once the page is live. With `--interest`, only the
-/// named interests are switched on and the rest are left as they are: how
-/// an interest added later reaches existing members.
+/// one-time step after `sync` introduces the group. With `--interest`,
+/// only the named interests are switched on and the rest are left as they
+/// are: how an interest added later reaches existing members.
+///
+/// Refuses to touch an interest any member already holds, since that would
+/// opt back in everyone who has switched it off. `--force` overrides.
 #[derive(Debug, clap::Args)]
 pub struct Seed {
     /// The id of the sync job
@@ -116,6 +139,9 @@ pub struct Seed {
     /// Switch on only this interest, by its configured name (repeatable)
     #[arg(long = "interest")]
     only: Vec<String>,
+    /// Seed even interests members already hold
+    #[arg(long)]
+    force: bool,
 }
 
 impl Seed {
@@ -125,7 +151,7 @@ impl Seed {
             seeded: usize,
         }
         let job = job(&settings, self.id).await?;
-        match job.seed_interests(&self.only).await? {
+        match job.seed_interests(&self.only, self.force).await? {
             Some(seeded) => print_json(&SeedResult { seeded }),
             None => anyhow::bail!(
                 "job {} has no preference group configured, or it is not on the audience yet (run `interests sync` first)",

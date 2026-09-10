@@ -95,8 +95,13 @@ Changing the list:
   sync 1 --process-deletes`. Without the flag the interest is reported as
   `extra` and left alone. Deleting it drops every member's setting for it.
 
-Never run `interests seed` without `--interest` once the page is live: that
-form opts everyone into everything.
+`sync-mail interests status 1` shows each interest with the number of members
+holding it beside the audience's subscribed count.
+
+`interests seed` refuses to touch an interest any member already holds,
+because that would opt back in everyone who switched it off; once the page
+is live the plain form refuses itself. `--force` is the override, for a
+deliberate re-opt-in of everyone.
 
 Edits made to the group in the MailChimp UI are the failure to watch for.
 The member sync refuses to run, before writing anything, when a configured

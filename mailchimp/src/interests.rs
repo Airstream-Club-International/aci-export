@@ -43,6 +43,33 @@ pub struct Interest {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_order: Option<u32>,
+    /// Members with this interest on. MailChimp returns it as a string.
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "deserialize_count::deserialize"
+    )]
+    pub subscriber_count: u64,
+}
+
+mod deserialize_count {
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Count {
+            Number(u64),
+            Text(String),
+        }
+        match Count::deserialize(deserializer)? {
+            Count::Number(n) => Ok(n),
+            Count::Text(s) => s.trim().parse().map_err(serde::de::Error::custom),
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -213,6 +240,7 @@ impl Interests {
                     .map(|i| ResolvedInterest {
                         name: i.name.clone(),
                         id: i.id.clone(),
+                        subscribers: i.subscriber_count,
                     })
                     .ok_or_else(|| Error::MissingInterest(wanted.name.clone()))
             })
@@ -321,6 +349,7 @@ impl Interests {
                     id: String::new(),
                     name: wanted.name.clone(),
                     display_order: Some(order as u32 + 1),
+                    subscriber_count: 0,
                 },
             )
             .await?;
@@ -402,6 +431,8 @@ pub struct Resolved {
 pub struct ResolvedInterest {
     pub name: String,
     pub id: String,
+    /// Members with the interest on when it was resolved
+    pub subscribers: u64,
 }
 
 impl Resolved {
@@ -419,17 +450,37 @@ impl Resolved {
     /// members without touching the choices they have already made. Errors
     /// on a name that is not a configured interest.
     pub fn on(&self, names: &[String]) -> Result<HashMap<String, bool>> {
+        self.named(names)
+            .map(|targets| targets.iter().map(|i| (i.id.clone(), true)).collect())
+    }
+
+    /// The configured interests with these names, or every one when
+    /// `names` is empty. Errors on a name that is not configured.
+    pub fn named(&self, names: &[String]) -> Result<Vec<&ResolvedInterest>> {
+        if names.is_empty() {
+            return Ok(self.interests.iter().collect());
+        }
         names
             .iter()
             .map(|name| {
                 self.interests
                     .iter()
                     .find(|i| &i.name == name)
-                    .map(|i| (i.id.clone(), true))
                     .ok_or_else(|| Error::MissingInterest(name.clone()))
             })
             .collect()
     }
+}
+
+/// Names of the interests some member already has on. Seeding is for an
+/// interest nobody holds yet; once members hold it, a seed would opt back
+/// in everyone who has since switched it off.
+pub fn already_held(targets: &[&ResolvedInterest]) -> Vec<String> {
+    targets
+        .iter()
+        .filter(|i| i.subscribers > 0)
+        .map(|i| i.name.clone())
+        .collect()
 }
 
 fn log_batch_interest_retry(err: &Error, sleep: std::time::Duration) {
@@ -523,6 +574,7 @@ mod tests {
                 id: format!("id{n}"),
                 name: i.name.clone(),
                 display_order: None,
+                subscriber_count: 0,
             })
             .collect()
     }
@@ -564,6 +616,7 @@ mod tests {
             id: "1".into(),
             name: "Caravans".into(),
             display_order: None,
+            subscriber_count: 0,
         }];
         assert_eq!(
             config.rename_target("Caravans", &existing),
@@ -574,6 +627,7 @@ mod tests {
             id: "2".into(),
             name: "Caravan Trips".into(),
             display_order: None,
+            subscriber_count: 0,
         });
         // Both names present: nothing to rename, the old one is extra.
         assert_eq!(config.rename_target("Caravans", &existing), None);
@@ -629,6 +683,7 @@ mod tests {
             id: "x".into(),
             name: "Renamed In The UI".into(),
             display_order: None,
+            subscriber_count: 0,
         });
         assert_eq!(config.extra_in(&existing), ["Renamed In The UI"]);
     }
@@ -640,13 +695,60 @@ mod tests {
                 ResolvedInterest {
                     name: "A".into(),
                     id: "a".into(),
+                    subscribers: 0,
                 },
                 ResolvedInterest {
                     name: "B".into(),
                     id: "b".into(),
+                    subscribers: 1,
                 },
             ],
         }
+    }
+
+    #[test]
+    fn subscriber_count_reads_string_or_number() {
+        let text = r#"{"id":"x","name":"N","subscriber_count":"42"}"#;
+        assert_eq!(
+            serde_json::from_str::<Interest>(text)
+                .expect("parse")
+                .subscriber_count,
+            42
+        );
+        let number = r#"{"id":"x","name":"N","subscriber_count":7}"#;
+        assert_eq!(
+            serde_json::from_str::<Interest>(number)
+                .expect("parse")
+                .subscriber_count,
+            7
+        );
+        let absent = r#"{"id":"x","name":"N"}"#;
+        assert_eq!(
+            serde_json::from_str::<Interest>(absent)
+                .expect("parse")
+                .subscriber_count,
+            0
+        );
+    }
+
+    #[test]
+    fn named_returns_all_when_empty_and_rejects_unknown() {
+        let r = resolved();
+        assert_eq!(r.named(&[]).expect("all").len(), 2);
+        assert_eq!(r.named(&["A".to_string()]).expect("one")[0].id, "a");
+        assert!(matches!(
+            r.named(&["C".to_string()]),
+            Err(Error::MissingInterest(n)) if n == "C"
+        ));
+    }
+
+    #[test]
+    fn already_held_names_interests_with_subscribers() {
+        let r = resolved();
+        let all = r.named(&[]).expect("all");
+        assert_eq!(already_held(&all), ["B"]);
+        let only_a = r.named(&["A".to_string()]).expect("a");
+        assert_eq!(already_held(&only_a), Vec::<String>::new());
     }
 
     #[test]
