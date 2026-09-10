@@ -20,10 +20,7 @@ name = "Caravans"
 name = "Short-Notice Caravan Go List"
 
 [[interests]]
-name = "International Rally"
-
-[[interests]]
-name = "National Event Rallies"
+name = "Events and Rallies"
 
 [[interests]]
 name = "Club Business (Governance)"

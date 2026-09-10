@@ -558,8 +558,7 @@ mod tests {
                 "Member Benefits/Partners",
                 "Caravans",
                 "Short-Notice Caravan Go List",
-                "International Rally",
-                "National Event Rallies",
+                "Events and Rallies",
                 "Club Business (Governance)",
             ]
         );
