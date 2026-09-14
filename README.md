@@ -109,3 +109,13 @@ interest is missing from the audience, so the scheduled run fails and the
 error names the interest. `sync-mail interests check 1` compares the audience
 to the config without changing anything and exits non-zero on any difference,
 including interests added in the UI; schedule it alongside the sync.
+
+## Keeping a contact the membership database does not list
+
+The member sync archives every live audience contact that is not in the
+membership database. A contact tagged `keep` in the MailChimp UI is the
+exception: the sync leaves it on the audience, and never writes or touches
+that tag itself. Use it for an address that must receive every campaign but
+has no membership record, such as a club's archival inbox. The tag also holds
+a lapsed member on the audience, since it means the same thing there.
+`sync-mail run --dry-run` omits kept contacts from the would-archive list.

@@ -110,13 +110,32 @@ pub async fn delete(client: &Client, list_id: &str, member_id: &str) -> Result<(
 /// archived by hand in the MailChimp UI (must stay archived).
 pub const SYNC_ARCHIVED_TAG: &str = "archived-by-sync";
 
-/// Archive every audience member not in `keep_keys`.
+/// Tag the audience owner applies in the MailChimp UI to a contact that is
+/// not in the membership database but must stay on the audience, such as an
+/// archival inbox that receives every campaign. The sync never writes this
+/// tag, and [`retain`] leaves a contact carrying it alone.
+pub const KEEP_TAG: &str = "keep";
+
+/// The audience members [`retain`] archives: live contacts not in
+/// `keep_keys` and not tagged [`KEEP_TAG`]. Members whose status is already
+/// `Archived` or `Cleaned` are excluded — there is nothing to archive, and
+/// re-touching an already-archived contact would clobber the admin-archived
+/// signal the next sync uses to decide whether to resubscribe.
+pub fn to_archive<'a>(
+    audience: &'a [Member],
+    keep_keys: &'a HashSet<String>,
+) -> impl Iterator<Item = &'a Member> {
+    audience
+        .iter()
+        .filter(|m| m.is_live())
+        .filter(move |m| !keep_keys.contains(&m.id))
+        .filter(|m| !m.is_kept())
+}
+
+/// Archive every audience member [`to_archive`] selects.
 ///
 /// The audience is supplied by the caller (typically fetched once at the
-/// start of a sync run and reused) rather than refetched here. Members whose
-/// status is already `Archived` or `Cleaned` are skipped — there is nothing
-/// to archive, and re-touching an already-archived contact would clobber the
-/// admin-archived signal the next sync uses to decide whether to resubscribe.
+/// start of a sync run and reused) rather than refetched here.
 ///
 /// Before each archive we set the [`SYNC_ARCHIVED_TAG`] tag so a future sync
 /// run can recognize sync-driven archives and resubscribe them safely.
@@ -128,15 +147,17 @@ pub async fn retain(
     audience: &[Member],
     keep_keys: &HashSet<String>,
 ) -> Result<usize> {
-    let to_archive: Vec<String> = audience
-        .iter()
-        .filter(|m| m.is_live())
-        .filter(|m| !keep_keys.contains(&m.id))
+    let to_archive: Vec<String> = to_archive(audience, keep_keys)
         .map(|m| m.id.clone())
         .collect();
+    let kept = audience
+        .iter()
+        .filter(|m| m.is_live() && !keep_keys.contains(&m.id) && m.is_kept())
+        .count();
 
     tracing::debug!(
         count = to_archive.len(),
+        kept,
         audience = audience.len(),
         "archiving members missing from source"
     );
@@ -669,6 +690,15 @@ impl Member {
         )
     }
 
+    /// Carries [`KEEP_TAG`], so [`retain`] leaves the contact on the
+    /// audience whether or not the source lists it. The tag is typed by
+    /// hand in the MailChimp UI, so the match ignores case.
+    pub fn is_kept(&self) -> bool {
+        self.tags
+            .iter()
+            .any(|t| t.name.eq_ignore_ascii_case(KEEP_TAG))
+    }
+
     /// The membership database user id carried in the `UID` merge field.
     /// MailChimp returns a number for a populated numeric field and an empty
     /// string for an unset one; a numeric string is accepted as well.
@@ -842,6 +872,35 @@ mod tests {
         ];
         let targets = vec![source("shared@x.org", 1), source("shared@x.org", 2)];
         assert_eq!(email_renames(&audience, &targets), vec![]);
+    }
+
+    fn tagged(email: &str, status: MemberStatus, tag: &str) -> Member {
+        let mut member = contact(email, None, status);
+        member.tags = vec![MemberTag {
+            name: tag.to_string(),
+        }];
+        member
+    }
+
+    #[test]
+    fn to_archive_selects_live_contacts_absent_from_source_and_not_kept() {
+        let audience = vec![
+            contact("member@x.org", Some(1), MemberStatus::Subscribed),
+            contact("gone@x.org", None, MemberStatus::Subscribed),
+            contact("gone-unsub@x.org", None, MemberStatus::Unsubscribed),
+            contact("done@x.org", None, MemberStatus::Archived),
+            tagged("archive@x.org", MemberStatus::Subscribed, KEEP_TAG),
+            tagged("archive-caps@x.org", MemberStatus::Subscribed, "Keep"),
+            tagged("other-tag@x.org", MemberStatus::Subscribed, "affiliate"),
+        ];
+        let keep: HashSet<String> = [member_id("member@x.org")].into();
+        let ids: Vec<&str> = to_archive(&audience, &keep)
+            .map(|m| m.email_address.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["gone@x.org", "gone-unsub@x.org", "other-tag@x.org"]
+        );
     }
 
     #[test]
