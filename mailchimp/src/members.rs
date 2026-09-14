@@ -524,10 +524,12 @@ pub mod tags {
             .await
     }
 
-    /// Sets at or below this size are sent as direct per-member requests.
-    /// A batch is queued on MailChimp's side and waits there whatever its
-    /// size, routinely for minutes, so it only pays off for large sets.
-    const DIRECT_UPDATE_MAX: usize = 100;
+    /// Sets at or below this size are sent as direct per-member requests,
+    /// ten in flight at a time (MailChimp's connection limit per key), which
+    /// covers a club-sized audience in seconds. A batch is queued on
+    /// MailChimp's side and waits there whatever its size, routinely for
+    /// minutes, so it only pays off for region and all-member runs.
+    const DIRECT_UPDATE_MAX: usize = 500;
 
     pub async fn update_many(
         client: &Client,
