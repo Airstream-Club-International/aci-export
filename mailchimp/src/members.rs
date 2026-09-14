@@ -537,7 +537,7 @@ pub mod tags {
     ) -> Result {
         if tag_updates.len() <= DIRECT_UPDATE_MAX {
             tracing::debug!(count = tag_updates.len(), "updating tags directly");
-            return futures::stream::iter(tag_updates)
+            return stream::iter(tag_updates)
                 .map(Ok::<_, Error>)
                 .try_for_each_concurrent(10, |(member_id, updates)| {
                     let client = client.clone();
