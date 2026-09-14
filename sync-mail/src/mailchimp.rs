@@ -619,14 +619,11 @@ impl Job {
             })
             .collect();
 
-        let would_archive: Vec<DryRunEntry> = audience
-            .into_iter()
-            .filter(|m| m.is_live())
-            .filter(|m| !upserted.contains(&m.id))
+        let would_archive: Vec<DryRunEntry> = members::to_archive(&audience, &upserted)
             .map(|m| DryRunEntry {
-                id: m.id,
-                email_address: m.email_address,
-                status: m.status,
+                id: m.id.clone(),
+                email_address: m.email_address.clone(),
+                status: m.status.clone(),
             })
             .collect();
 
