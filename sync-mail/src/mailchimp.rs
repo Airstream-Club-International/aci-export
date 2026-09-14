@@ -526,7 +526,12 @@ impl Job {
             None => 0,
         };
 
-        tracing::debug!(resubscribed, defaulted, "upserting members");
+        tracing::debug!(
+            count = mc_members.len(),
+            resubscribed,
+            defaulted,
+            "upserting members"
+        );
         let upserted = members::upsert_many(
             &client,
             &self.list,
@@ -534,13 +539,14 @@ impl Job {
             RetryPolicy::Retries(3),
         )
         .await?;
+        tracing::debug!(count = upserted.len(), "upserted members");
 
         tracing::debug!("archiving removed members");
         keep.extend(upserted.iter().cloned());
         let archived = members::retain(&client, &self.list, &audience, &keep).await?;
 
-        tracing::debug!("updating tags");
         let tag_updates = ddb::members::mailchimp::to_tag_updates(&db_members);
+        tracing::debug!(count = tag_updates.len(), "updating tags");
         members::tags::update_many(
             &client,
             &self.list,

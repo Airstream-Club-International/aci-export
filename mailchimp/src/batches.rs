@@ -55,9 +55,21 @@ impl Batch {
 
     pub async fn run(&self, client: &Client, to_completion: bool) -> Result<BatchInfo> {
         let mut info: BatchInfo = client.post("/3.0/batches", self).await?;
+        tracing::debug!(
+            batch_id = info.id,
+            operations = info.total_operations,
+            "batch submitted"
+        );
         while to_completion && info.status != BatchStatus::Finished {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             info = for_id(client, &info.id).await?;
+            tracing::debug!(
+                batch_id = info.id,
+                status = ?info.status,
+                finished = info.finished_operations,
+                total = info.total_operations,
+                "batch status"
+            );
         }
         Ok(info)
     }
