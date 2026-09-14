@@ -32,6 +32,10 @@ fn log_batch_tag_retry(err: &Error, sleep: std::time::Duration) {
     tracing::warn!(%err, sleep = sleep.as_secs(), "batch tag update");
 }
 
+fn log_tag_retry(err: &Error, sleep: std::time::Duration) {
+    tracing::warn!(%err, sleep = sleep.as_secs(), "tag update");
+}
+
 pub fn all(client: &Client, list_id: &str, query: MembersQuery) -> Stream<Member> {
     client.fetch_stream::<MembersQuery, MembersResponse>(
         &format!("/3.0/lists/{list_id}/members"),
@@ -131,6 +135,11 @@ pub async fn retain(
         .map(|m| m.id.clone())
         .collect();
 
+    tracing::debug!(
+        count = to_archive.len(),
+        audience = audience.len(),
+        "archiving members missing from source"
+    );
     if to_archive.is_empty() {
         return Ok(0);
     }
@@ -515,12 +524,40 @@ pub mod tags {
             .await
     }
 
+    /// Sets at or below this size are sent as direct per-member requests,
+    /// ten in flight at a time (MailChimp's connection limit per key), which
+    /// covers a club-sized audience in seconds. A batch is queued on
+    /// MailChimp's side and waits there whatever its size, routinely for
+    /// minutes, so it only pays off for region and all-member runs.
+    const DIRECT_UPDATE_MAX: usize = 500;
+
     pub async fn update_many(
         client: &Client,
         list_id: &str,
         tag_updates: &[(String, Vec<MemberTagUpdate>)],
         retries: RetryPolicy,
     ) -> Result {
+        if tag_updates.len() <= DIRECT_UPDATE_MAX {
+            tracing::debug!(count = tag_updates.len(), "updating tags directly");
+            return stream::iter(tag_updates)
+                .map(Ok::<_, Error>)
+                .try_for_each_concurrent(10, |(member_id, updates)| {
+                    let client = client.clone();
+                    async move {
+                        Retry::spawn_notify(
+                            retries,
+                            || {
+                                update(&client, list_id, member_id, updates)
+                                    .map_err(Error::into_retry)
+                            },
+                            log_tag_retry,
+                        )
+                        .await
+                    }
+                })
+                .await;
+        }
+        tracing::debug!(count = tag_updates.len(), "updating tags in batches");
         futures::stream::iter(tag_updates)
             .chunks(1000)
             .map(Ok::<Vec<_>, Error>)
