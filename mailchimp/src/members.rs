@@ -150,9 +150,14 @@ pub async fn retain(
     let to_archive: Vec<String> = to_archive(audience, keep_keys)
         .map(|m| m.id.clone())
         .collect();
+    let kept = audience
+        .iter()
+        .filter(|m| m.is_live() && !keep_keys.contains(&m.id) && m.is_kept())
+        .count();
 
     tracing::debug!(
         count = to_archive.len(),
+        kept,
         audience = audience.len(),
         "archiving members missing from source"
     );
@@ -686,9 +691,12 @@ impl Member {
     }
 
     /// Carries [`KEEP_TAG`], so [`retain`] leaves the contact on the
-    /// audience whether or not the source lists it.
+    /// audience whether or not the source lists it. The tag is typed by
+    /// hand in the MailChimp UI, so the match ignores case.
     pub fn is_kept(&self) -> bool {
-        self.tags.iter().any(|t| t.name == KEEP_TAG)
+        self.tags
+            .iter()
+            .any(|t| t.name.eq_ignore_ascii_case(KEEP_TAG))
     }
 
     /// The membership database user id carried in the `UID` merge field.
@@ -882,6 +890,7 @@ mod tests {
             contact("gone-unsub@x.org", None, MemberStatus::Unsubscribed),
             contact("done@x.org", None, MemberStatus::Archived),
             tagged("archive@x.org", MemberStatus::Subscribed, KEEP_TAG),
+            tagged("archive-caps@x.org", MemberStatus::Subscribed, "Keep"),
             tagged("other-tag@x.org", MemberStatus::Subscribed, "affiliate"),
         ];
         let keep: HashSet<String> = [member_id("member@x.org")].into();
