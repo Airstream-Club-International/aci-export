@@ -106,9 +106,10 @@ deliberate re-opt-in of everyone.
 Edits made to the group in the MailChimp UI are the failure to watch for.
 The member sync refuses to run, before writing anything, when a configured
 interest is missing from the audience, so the scheduled run fails and the
-error names the interest. `sync-mail interests check 1` compares the audience
-to the config without changing anything and exits non-zero on any difference,
-including interests added in the UI; schedule it alongside the sync.
+error names the interest. After its writes, the member sync runs the same
+comparison and fails on any remaining difference, such as an interest added
+in the UI, so one scheduled run covers both. `sync-mail interests check 1`
+runs that comparison on its own, without changing anything.
 
 ## Keeping a contact the membership database does not list
 

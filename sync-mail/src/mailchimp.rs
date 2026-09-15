@@ -555,6 +555,25 @@ impl Job {
         )
         .await?;
 
+        // Every write is done. A preference group that has drifted from
+        // config in a way the sync tolerates, an interest added in the
+        // MailChimp UI, still fails the run here so the drift is seen where
+        // the run is watched. Missing interests failed before any write.
+        if let Some(check) = self.check_interests().await?
+            && !check.is_clean()
+        {
+            tracing::error!(
+                missing = ?check.missing,
+                extra = ?check.extra,
+                "preference group differs from config"
+            );
+            anyhow::bail!(
+                "preference group differs from config after sync: missing {:?}, extra {:?}",
+                check.missing,
+                check.extra
+            );
+        }
+
         let duration = start.elapsed().as_secs();
         let result = JobSyncResult {
             name: self.name.clone(),
