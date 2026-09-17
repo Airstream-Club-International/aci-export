@@ -4,7 +4,7 @@ use futures::TryFutureExt;
 use mailchimp::{
     RetryPolicy,
     interests::{Interests, Resolved},
-    members::{self, EmailRename, Member, MemberStatus, MembersQuery, member_id},
+    members::{self, EmailRename, Member, MemberStatus, MemberTagUpdate, MembersQuery, member_id},
     merge_fields::MergeFields,
 };
 use sqlx::{Database, Encode, MySqlPool, PgPool, Type, query::QueryAs};
@@ -546,6 +546,15 @@ impl Job {
         let archived = members::retain(&client, &self.list, &audience, &keep).await?;
 
         let tag_updates = ddb::members::mailchimp::to_tag_updates(&db_members);
+        let wanted = tag_updates.len();
+        let tag_updates = tags_for_upserted(tag_updates, &upserted);
+        let skipped = wanted - tag_updates.len();
+        if skipped > 0 {
+            tracing::warn!(
+                count = skipped,
+                "tags withheld from contacts the upsert did not land"
+            );
+        }
         tracing::debug!(count = tag_updates.len(), "updating tags");
         members::tags::update_many(
             &client,
@@ -732,6 +741,22 @@ fn withhold_failed_renames(
     failed.iter().map(|r| r.id.clone()).collect()
 }
 
+/// Keep only the tag updates whose contact the upsert landed. An update
+/// addresses a contact by the hash of its email, so one for an address
+/// MailChimp refused can name a contact that is not on the audience, and a
+/// tag write to a contact that is not there fails the whole run: a 404 on
+/// the direct path, an errored operation in a batch. A member held back
+/// here is tagged by the first run whose upsert lands it.
+fn tags_for_upserted(
+    tag_updates: Vec<(String, Vec<MemberTagUpdate>)>,
+    upserted: &HashSet<String>,
+) -> Vec<(String, Vec<MemberTagUpdate>)> {
+    tag_updates
+        .into_iter()
+        .filter(|(id, _)| upserted.contains(id))
+        .collect()
+}
+
 /// Switch every preference on for members who are new to the audience or
 /// returning from a sync-driven archive, and count them. Every other
 /// contact is left untouched: their preferences are theirs to set on the
@@ -813,6 +838,28 @@ mod tests {
             ["other@x.org"]
         );
         assert_eq!(keep, [member_id("old@x.org")].into());
+    }
+
+    #[test]
+    fn tags_go_only_to_contacts_the_upsert_landed() {
+        let tags = vec![MemberTagUpdate {
+            name: "affiliate".into(),
+            status: members::MemberTagStatus::Inactive,
+        }];
+        let tag_updates = vec![
+            (member_id("landed@x.org"), tags.clone()),
+            (member_id("refused@x.cm"), tags.clone()),
+            (member_id("partner@x.org"), tags),
+        ];
+        let upserted: HashSet<String> =
+            [member_id("landed@x.org"), member_id("partner@x.org")].into();
+
+        let kept = tags_for_upserted(tag_updates, &upserted);
+
+        assert_eq!(
+            kept.into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            vec![member_id("landed@x.org"), member_id("partner@x.org")]
+        );
     }
 
     #[test]
