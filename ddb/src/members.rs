@@ -951,8 +951,8 @@ pub mod mailchimp {
         ]
         .into_iter()
         .filter_map(|value| value.transpose())
-        .chain(address_to_values(address, merge_fields).into_iter())
-        .chain(club_to_values(&member.local_club, merge_fields).into_iter())
+        .chain(address_to_values(address, merge_fields))
+        .chain(club_to_values(&member.local_club, merge_fields))
         .collect::<mc::Result<Vec<mc::merge_fields::MergeFieldValue>>>()?;
         Ok(mc::members::Member {
             id: mc::members::member_id(&user.email),
