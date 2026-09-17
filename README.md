@@ -120,3 +120,19 @@ that tag itself. Use it for an address that must receive every campaign but
 has no membership record, such as a club's archival inbox. The tag also holds
 a lapsed member on the audience, since it means the same thing there.
 `sync-mail run --dry-run` omits kept contacts from the would-archive list.
+
+## Addresses MailChimp refuses
+
+Members type their own email addresses, so some of what the membership
+database holds is a typo (`@gmail.cm`, `@yahoo.con`), a placeholder, or an
+address MailChimp has permanently deleted. MailChimp rejects these per
+contact when the sync upserts them, and the run carries on: each rejection
+is logged as a warning naming the address, and that member's tags are held
+back for the run. A tag write is addressed by the hash of the member's
+email, so sending one for a contact MailChimp would not create fails the
+whole job.
+
+Fix the address in the membership database and the next run picks the
+member up. `was permanently deleted and cannot be re-imported` is the one
+that a corrected address will not solve: that contact has to re-subscribe
+themselves.
