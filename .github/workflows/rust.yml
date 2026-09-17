@@ -53,3 +53,19 @@ jobs:
       - name: Build | Compile
         run: cargo build --all --locked --release
 
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup | Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+
+      - name: Setup | Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup | Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build | Test
+        run: cargo test --all --locked
