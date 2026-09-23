@@ -768,8 +768,9 @@ pub struct Member {
     /// all-members queries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub join_date: Option<chrono::NaiveDate>,
-    /// Date the member first joined ACI, kept across lapses and renewals.
-    /// This is the membership anniversary.
+    /// ACI join date from the Drupal member record (`membership_join_year`).
+    /// This is the membership anniversary, not the start of the current
+    /// membership period.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aci_join_date: Option<chrono::NaiveDate>,
     #[sqlx(flatten, try_from = "LocalClub")]
