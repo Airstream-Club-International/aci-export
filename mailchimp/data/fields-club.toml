@@ -40,7 +40,12 @@ type = "text"
 
 [[merge_fields]]
 tag = "JOIN"
-name = "Join Date"
+name = "Club Join Date"
+type = "date"
+
+[[merge_fields]]
+tag = "ACI_SINCE"
+name = "ACI Member Since"
 type = "date"
 
 [[merge_fields]]
