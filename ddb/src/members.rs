@@ -306,7 +306,8 @@ const FETCH_ALL_MEMBERS_QUERY: &str = r#"
         brns.brns_values AS brns,
 
         CAST(alldata.membership_expire AS DATE) as expiration_date,
-        CAST(alldata.membership_join_year AS DATE) as join_date
+        CAST(alldata.membership_join_year AS DATE) as join_date,
+        CAST(NULLIF(alldata.membership_join_year, '') AS DATE) as aci_join_date
 
     FROM
     	paragraphs_item_field_data
@@ -494,6 +495,7 @@ SELECT
   COALESCE(ttd.name, 'Regular')                AS member_class,
   md.personal_status_id                        AS member_status,
   earliest_join.earliest_join_date             AS join_date,
+  CAST(NULLIF(md.membership_join_year, '') AS DATE) AS aci_join_date,
   flags.latest_expiration_date                 AS expiration_date,
 
   /* ===================== CLUB FIELDS ===================== */
@@ -761,8 +763,16 @@ pub struct Member {
     pub partner: Option<User>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expiration_date: Option<chrono::NaiveDate>,
+    /// First join date in the queried scope: the earliest membership in the
+    /// club or region for club and region queries, the ACI join date for
+    /// all-members queries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub join_date: Option<chrono::NaiveDate>,
+    /// ACI join date from the Drupal member record (`membership_join_year`).
+    /// This is the membership anniversary, not the start of the current
+    /// membership period.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aci_join_date: Option<chrono::NaiveDate>,
     #[sqlx(flatten, try_from = "LocalClub")]
     pub local_club: Club,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -946,6 +956,7 @@ pub mod mailchimp {
             merge_fields.to_value("BDAY", user.birthday),
             merge_fields.to_value("LLOGIN", user.last_login),
             merge_fields.to_value("JOIN", member.join_date),
+            merge_fields.to_value("ACI_SINCE", member.aci_join_date),
             merge_fields.to_value("EXPIRE", member.expiration_date),
             merge_fields.to_value("BRN", member.brns.first()),
         ]
@@ -993,6 +1004,67 @@ pub mod mailchimp {
         .into_iter()
         .filter_map(|value| value.transpose())
         .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn date(text: &str) -> NaiveDate {
+            text.parse().expect("parse date")
+        }
+
+        fn user(uid: u64, email: &str) -> User {
+            User {
+                uid,
+                email: email.to_string(),
+                first_name: None,
+                last_name: None,
+                birthday: None,
+                last_login: None,
+                pass: None,
+                gender: None,
+                race_tid: None,
+                communication_preference: None,
+                blue_beret_mail: None,
+                publish_info: None,
+                special_needs: None,
+                ada_parking: None,
+                member_notes: None,
+                military_status: None,
+                first_responder_status: None,
+                active: true,
+            }
+        }
+
+        #[test]
+        fn club_audience_carries_club_join_and_aci_since_separately() {
+            let member = Member {
+                member_class: MemberClass::Regular,
+                member_type: MemberType::Regular,
+                member_status: MemberStatus::Current,
+                primary: user(1, "primary@example.org"),
+                partner: None,
+                expiration_date: None,
+                join_date: Some(date("2024-11-12")),
+                aci_join_date: Some(date("2024-09-23")),
+                local_club: clubs::Club {
+                    uid: 1755,
+                    number: Some(137),
+                    name: "Club".to_string(),
+                    region: None,
+                    active: true,
+                },
+                brns: vec![],
+            };
+            let fields = mc::merge_fields::MergeFields::club().expect("load club fields");
+
+            let contacts = to_members(&member, &None, &fields).expect("build contacts");
+            let merge_fields = contacts[0].merge_fields.as_ref().expect("merge fields");
+
+            assert_eq!(merge_fields["JOIN"], "2024-11-12");
+            assert_eq!(merge_fields["ACI_SINCE"], "2024-09-23");
+        }
     }
 }
 
