@@ -455,14 +455,16 @@ flags AS (
 ),
 
 active_pick AS (
-  SELECT a1.uid, a1.paragraph_id, a1.club_nid
-  FROM acp a1
-  JOIN (
-    SELECT uid, MAX(DATE(join_dt_raw)) AS max_join
+  /* Each user's active memberships with the latest join date; RANK keeps
+     every membership tied on that date. The window function makes MariaDB
+     compute this CTE once instead of merging it into the outer query. */
+  SELECT uid, paragraph_id, club_nid
+  FROM (
+    SELECT uid, paragraph_id, club_nid,
+           RANK() OVER (PARTITION BY uid ORDER BY DATE(join_dt_raw) DESC) AS join_rank
     FROM acp
-    GROUP BY uid
-  ) pick
-    ON pick.uid = a1.uid AND pick.max_join = DATE(a1.join_dt_raw)
+  ) ranked
+  WHERE join_rank = 1
 )
 
 SELECT
