@@ -366,8 +366,7 @@ struct PartnerUser {
 
 impl From<PartnerUser> for Option<user::User> {
     fn from(value: PartnerUser) -> Option<user::User> {
-        if let Some(uid) = value.partner_uid {
-            let partner_email = value.partner_email.unwrap();
+        if let (Some(uid), Some(partner_email)) = (value.partner_uid, value.partner_email) {
             Some(user::User {
                 uid,
                 id: id_for_email(&partner_email),
@@ -398,5 +397,28 @@ impl From<LocalClub> for club::Club {
             name: value.club_name.unwrap_or_default(),
             region: value.club_region,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn partner(uid: Option<i64>, email: Option<&str>) -> Option<user::User> {
+        PartnerUser {
+            partner_uid: uid,
+            partner_email: email.map(str::to_string),
+            partner_first_name: None,
+            partner_last_name: None,
+        }
+        .into()
+    }
+
+    #[test]
+    fn a_partner_needs_both_a_uid_and_an_email() {
+        let user = partner(Some(7), Some("p@example.com")).expect("partner with uid and email");
+        assert_eq!((user.uid, user.email.as_str()), (7, "p@example.com"));
+        assert!(partner(Some(7), None).is_none());
+        assert!(partner(None, Some("p@example.com")).is_none());
     }
 }

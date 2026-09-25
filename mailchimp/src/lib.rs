@@ -142,7 +142,7 @@ pub mod client {
 
     pub fn from_api_key(key: &str) -> Result<crate::Client> {
         let auth = crate::AuthMode::new_basic_auth(key)?;
-        Ok(crate::Client::new(auth))
+        crate::Client::new(auth)
     }
 }
 
@@ -150,24 +150,23 @@ impl Client {
     /// Create a new client using a given base URL and a default
     /// timeout. The library will use absoluate paths based on this
     /// base_url.
-    pub fn new(auth: AuthMode) -> Self {
+    pub fn new(auth: AuthMode) -> Result<Self> {
         Self::new_with_timeout(auth, DEFAULT_TIMEOUT)
     }
 
     /// Create a new client using a given base URL, and request
     /// timeout value.  The library will use absoluate paths based on
     /// the given base_url.
-    pub fn new_with_timeout(auth: AuthMode, timeout: u64) -> Self {
+    pub fn new_with_timeout(auth: AuthMode, timeout: u64) -> Result<Self> {
         let client = reqwest::Client::builder()
             .gzip(true)
             .timeout(Duration::from_secs(timeout))
-            .build()
-            .unwrap();
-        Self {
+            .build()?;
+        Ok(Self {
             auth,
             client,
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
-        }
+        })
     }
 
     /// Send a request once one of the client's connections is free, and hold
@@ -659,7 +658,10 @@ mod tests {
             auth_header: HeaderValue::from_static("Basic test"),
             endpoint,
         });
-        (Client::new_with_timeout(auth, 1), in_flight)
+        (
+            Client::new_with_timeout(auth, 1).expect("build client"),
+            in_flight,
+        )
     }
 
     /// Send `n` requests at once from clones of `client`, cycling through
