@@ -1,4 +1,9 @@
-use crate::{Result, cmd::print_json, mailchimp::Job, settings::Settings};
+use crate::{
+    Result,
+    cmd::print_json,
+    mailchimp::{JOB_CONCURRENCY, Job},
+    settings::Settings,
+};
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 
 /// Sync the mailing list merge fields for a given club (or all) to mailchimp
@@ -46,7 +51,7 @@ impl Cmd {
                     })
                     .await
             })
-            .buffered(20)
+            .buffered(JOB_CONCURRENCY)
             .try_collect::<Vec<(i64, JobResult)>>()
             .await?;
         let map: std::collections::HashMap<i64, JobResult> = results.into_iter().collect();

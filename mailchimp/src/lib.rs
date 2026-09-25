@@ -1,11 +1,14 @@
 use futures::{
-    Future as StdFuture, FutureExt, Stream as StdStream, StreamExt, TryFutureExt, future, stream,
+    Future as StdFuture, FutureExt, Stream as StdStream, StreamExt, TryFutureExt, stream,
 };
 use reqwest::{
     Method, RequestBuilder, StatusCode, Url,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
 };
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{
+    Serialize,
+    de::{DeserializeOwned, IgnoredAny},
+};
 use std::{fmt::Debug, pin::Pin, str::FromStr, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use tokio_retry2::strategy::jitter;
@@ -34,8 +37,9 @@ pub use error::{Error, Result};
 pub const DEFAULT_TIMEOUT: u64 = 120;
 /// Requests a client has in flight at once. MailChimp refuses an account's
 /// connections beyond 10 with a 429; the margin leaves room for anything
-/// else using the account.
-const MAX_CONNECTIONS: usize = 8;
+/// else using the account. The library's concurrent loops fan out this
+/// wide too, since any wider only queues behind the cap.
+pub(crate) const MAX_CONNECTIONS: usize = 8;
 /// How long a client waits after a 429 before reporting it, so a retry does
 /// not arrive while whatever holds the account's connections still does.
 const RATE_LIMITED_BACKOFF: Duration = Duration::from_secs(10);
@@ -175,23 +179,23 @@ impl Client {
     }
 
     /// Send a request once one of the client's connections is free, and hold
-    /// the connection until `read` has consumed the response. reqwest starts
-    /// its timeout at `send`, so waiting for a connection does not count
-    /// against it. A 429 is returned only after `rate_limited_backoff`, with
-    /// the connection released, so every caller's retry waits it out.
-    fn send<R, F>(&self, request: RequestBuilder, read: F) -> Future<R>
+    /// the connection until the response is decoded. reqwest starts its
+    /// timeout at `send`, so waiting for a connection does not count against
+    /// it. A 429 is returned only after `rate_limited_backoff`, with the
+    /// connection released, so every caller's retry waits it out.
+    fn send<R>(&self, request: Result<RequestBuilder>) -> Future<R>
     where
-        R: 'static + Send,
-        F: FnOnce(reqwest::Response) -> Future<R> + Send + 'static,
+        R: 'static + DeserializeOwned + Send,
     {
         let connections = self.connections.clone();
         let backoff = self.rate_limited_backoff;
         async move {
+            let request = request?;
             let (rate_limited, result) = {
                 let _permit = connections.acquire().await?;
                 let response = request.send().await?;
                 let rate_limited = response.status() == StatusCode::TOO_MANY_REQUESTS;
-                (rate_limited, read(response).await)
+                (rate_limited, decode(response).await)
             };
             if rate_limited {
                 tokio::time::sleep(backoff).await;
@@ -217,40 +221,8 @@ impl Client {
         T: 'static + DeserializeOwned + Send,
         Q: Serialize + ?Sized,
     {
-        match self.request(Method::GET, path) {
-            Ok(builder) => self.send(builder.query(query), |response| {
-                let status = response.status();
-                if status.is_client_error() {
-                    return response
-                        .json::<error::MailchimError>()
-                        .map_err(error::Error::from)
-                        .and_then(|e| async move { Err(Error::mailchimp(e)) })
-                        .boxed();
-                }
-                match response.error_for_status() {
-                    Ok(result) => result
-                        .bytes()
-                        .map_err(Error::from)
-                        .and_then(|bytes| async move {
-                            // println!("{}", String::from_utf8_lossy(&bytes));
-                            serde_json::from_slice(&bytes).map_err(error::Error::from)
-                        })
-                        .boxed(),
-                    Err(e) => future::err(error::Error::from(e)).boxed(),
-                }
-            }),
-            Err(e) => future::err(e).boxed(),
-        }
+        self.send(self.request(Method::GET, path).map(|b| b.query(query)))
     }
-
-    // pub async fn fetch_all<Q, R>(&self, path: &str, mut query: Q) -> Result<Vec<R::Item>>
-    // where
-    //     R: PagedResponse + 'static,
-    //     Q: PagedQuery + 'static + Serialize,
-    // {
-    //     let client = self.clone();
-    //     let path = path.to_string();
-    // }
 
     pub fn fetch_stream<Q, R>(&self, path: &str, mut query: Q) -> Stream<R::Item>
     where
@@ -262,7 +234,6 @@ impl Client {
 
         self.fetch::<R, _>(&path, &query)
             .map_ok(move |data| {
-                // let mut query = query.clone();
                 query.inc_offset(data.len());
                 stream::try_unfold(
                     (data, client, path, query),
@@ -294,35 +265,7 @@ impl Client {
         T: Serialize + ?Sized,
         R: 'static + DeserializeOwned + std::marker::Send,
     {
-        match self.request(method, path) {
-            Ok(builder) => self.send(builder.json(json), |response| {
-                let status = response.status();
-                if status.is_client_error() {
-                    return response
-                        .json::<error::MailchimError>()
-                        .map_err(error::Error::from)
-                        .and_then(|e| async move { Err(Error::mailchimp(e)) })
-                        .boxed();
-                }
-                match response.error_for_status() {
-                    Ok(result) => result
-                        .bytes()
-                        .map_err(error::Error::from)
-                        .and_then(|bytes| async move {
-                            if bytes.is_empty() {
-                                serde_json::from_str("null").map_err(error::Error::from)
-                            } else {
-                                // println!("{}", String::from_utf8_lossy(&bytes));
-                                serde_json::from_slice(&bytes).map_err(error::Error::from)
-                            }
-                        })
-                        .boxed(),
-                    // Ok(result) => result.json().map_err(error::Error::from).boxed(),
-                    Err(e) => future::err(error::Error::from(e)).boxed(),
-                }
-            }),
-            Err(e) => future::err(e).boxed(),
-        }
+        self.send(self.request(method, path).map(|b| b.json(json)))
     }
 
     pub fn post<T, R>(&self, path: &str, json: &T) -> Future<R>
@@ -350,14 +293,22 @@ impl Client {
     }
 
     pub fn delete(&self, path: &str) -> Future<()> {
-        match self.request(Method::DELETE, path) {
-            Ok(builder) => self.send(builder, |response| match response.error_for_status() {
-                Ok(response) => response.bytes().map_ok(drop).map_err(Error::from).boxed(),
-                Err(e) => future::err(error::Error::from(e)).boxed(),
-            }),
-            Err(e) => future::err(e).boxed(),
-        }
+        self.send::<IgnoredAny>(self.request(Method::DELETE, path))
+            .map_ok(drop)
+            .boxed()
     }
+}
+
+/// Read a response as `R`. A 4xx carries MailChimp's problem document, any
+/// other failure status is a request error, and an empty success body (a
+/// DELETE's 204) reads as JSON `null`.
+async fn decode<R: DeserializeOwned>(response: reqwest::Response) -> Result<R> {
+    if response.status().is_client_error() {
+        return Err(Error::mailchimp(response.json().await?));
+    }
+    let bytes = response.error_for_status()?.bytes().await?;
+    let json: &[u8] = if bytes.is_empty() { b"null" } else { &bytes };
+    Ok(serde_json::from_slice(json)?)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -602,6 +553,7 @@ impl serde::de::Visitor<'_> for I32Visitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::future;
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::{
@@ -721,6 +673,29 @@ mod tests {
         let (client, _) = serve(Duration::from_millis(700), OK).await;
         let results = request_many(&client, 16).await;
         assert!(results.iter().all(Result::is_ok), "{results:?}");
+    }
+
+    #[tokio::test]
+    async fn every_method_reads_a_status_the_same_way() {
+        let cases: [((&'static str, &'static str), fn(&Result<()>) -> bool); 3] = [
+            (
+                (
+                    "404 Not Found",
+                    r#"{"status":404,"title":"Resource Not Found","detail":"","instance":""}"#,
+                ),
+                |r| matches!(r, Err(Error::Mailchimp(err)) if err.status == 404),
+            ),
+            (("500 Internal Server Error", ""), |r| {
+                matches!(r, Err(Error::Request(_)))
+            }),
+            (("204 No Content", ""), Result::is_ok),
+        ];
+        for (reply, expected) in cases {
+            let (client, _) = serve(Duration::ZERO, reply).await;
+            // One each of GET, POST and DELETE.
+            let results = request_many(&client, 3).await;
+            assert!(results.iter().all(expected), "{}: {results:?}", reply.0);
+        }
     }
 
     #[tokio::test]

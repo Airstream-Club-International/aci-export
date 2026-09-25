@@ -13,6 +13,10 @@ use std::{
     time::Instant,
 };
 
+/// Jobs run at once. Each job's audience is its own MailChimp account, and
+/// its client caps that account's connections, so this bounds local work only.
+pub const JOB_CONCURRENCY: usize = 20;
+
 #[derive(Debug, serde::Serialize)]
 pub struct JobSyncResult {
     pub name: String,
@@ -296,7 +300,7 @@ impl Job {
                     (id, name, outcome)
                 }
             })
-            .buffered(20)
+            .buffered(JOB_CONCURRENCY)
             .collect()
             .await;
 
@@ -336,7 +340,7 @@ impl Job {
                     }
                 }
             })
-            .buffered(20)
+            .buffered(JOB_CONCURRENCY)
             .collect::<Vec<_>>()
             .await
             .into_iter()
