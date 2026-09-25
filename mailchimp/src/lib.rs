@@ -6,7 +6,8 @@ use reqwest::{
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
 };
 use serde::{Serialize, de::DeserializeOwned};
-use std::{fmt::Debug, pin::Pin, str::FromStr, time::Duration};
+use std::{fmt::Debug, pin::Pin, str::FromStr, sync::Arc, time::Duration};
+use tokio::sync::Semaphore;
 use tokio_retry2::strategy::jitter;
 
 /// A type alias for `Future` that may return `crate::error::Error`
@@ -26,8 +27,15 @@ pub mod merge_fields;
 
 pub use error::{Error, Result};
 
-/// The default timeout for API requests
-pub const DEFAULT_TIMEOUT: u64 = 20;
+/// The default timeout for API requests, in seconds. MailChimp gives up on a
+/// call at 120 seconds; giving up sooner leaves it still working on a
+/// request we have stopped counting, holding one of the account's
+/// connections.
+pub const DEFAULT_TIMEOUT: u64 = 120;
+/// Requests a client has in flight at once. MailChimp refuses an account's
+/// connections beyond 10 with a 429; the margin leaves room for anything
+/// else using the account.
+const MAX_CONNECTIONS: usize = 8;
 /// A utility constant to pass an empty query slice to the various client fetch
 /// functions
 pub const NO_QUERY: &[&str; 0] = &[""; 0];
@@ -125,6 +133,8 @@ where
 pub struct Client {
     auth: AuthMode,
     client: reqwest::Client,
+    /// Shared by every clone, so one job's requests draw on one budget.
+    connections: Arc<Semaphore>,
 }
 
 pub mod client {
@@ -153,7 +163,29 @@ impl Client {
             .timeout(Duration::from_secs(timeout))
             .build()
             .unwrap();
-        Self { auth, client }
+        Self {
+            auth,
+            client,
+            connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+        }
+    }
+
+    /// Send a request once one of the client's connections is free, and hold
+    /// the connection until `read` has consumed the response. reqwest starts
+    /// its timeout at `send`, so waiting for a connection does not count
+    /// against it.
+    fn send<R, F>(&self, request: RequestBuilder, read: F) -> Future<R>
+    where
+        R: 'static + Send,
+        F: FnOnce(reqwest::Response) -> Future<R> + Send + 'static,
+    {
+        let connections = self.connections.clone();
+        async move {
+            let _permit = connections.acquire().await?;
+            let response = request.send().await?;
+            read(response).await
+        }
+        .boxed()
     }
 
     fn request(&self, method: Method, path: &str) -> Result<RequestBuilder> {
@@ -173,32 +205,27 @@ impl Client {
         Q: Serialize + ?Sized,
     {
         match self.request(Method::GET, path) {
-            Ok(builder) => builder
-                .query(query)
-                .send()
-                .map_err(Error::from)
-                .and_then(|response| {
-                    let status = response.status();
-                    if status.is_client_error() {
-                        return response
-                            .json::<error::MailchimError>()
-                            .map_err(error::Error::from)
-                            .and_then(|e| async move { Err(Error::mailchimp(e)) })
-                            .boxed();
-                    }
-                    match response.error_for_status() {
-                        Ok(result) => result
-                            .bytes()
-                            .map_err(Error::from)
-                            .and_then(|bytes| async move {
-                                // println!("{}", String::from_utf8_lossy(&bytes));
-                                serde_json::from_slice(&bytes).map_err(error::Error::from)
-                            })
-                            .boxed(),
-                        Err(e) => future::err(error::Error::from(e)).boxed(),
-                    }
-                })
-                .boxed(),
+            Ok(builder) => self.send(builder.query(query), |response| {
+                let status = response.status();
+                if status.is_client_error() {
+                    return response
+                        .json::<error::MailchimError>()
+                        .map_err(error::Error::from)
+                        .and_then(|e| async move { Err(Error::mailchimp(e)) })
+                        .boxed();
+                }
+                match response.error_for_status() {
+                    Ok(result) => result
+                        .bytes()
+                        .map_err(Error::from)
+                        .and_then(|bytes| async move {
+                            // println!("{}", String::from_utf8_lossy(&bytes));
+                            serde_json::from_slice(&bytes).map_err(error::Error::from)
+                        })
+                        .boxed(),
+                    Err(e) => future::err(error::Error::from(e)).boxed(),
+                }
+            }),
             Err(e) => future::err(e).boxed(),
         }
     }
@@ -255,37 +282,32 @@ impl Client {
         R: 'static + DeserializeOwned + std::marker::Send,
     {
         match self.request(method, path) {
-            Ok(builder) => builder
-                .json(json)
-                .send()
-                .map_err(error::Error::from)
-                .and_then(|response| {
-                    let status = response.status();
-                    if status.is_client_error() {
-                        return response
-                            .json::<error::MailchimError>()
-                            .map_err(error::Error::from)
-                            .and_then(|e| async move { Err(Error::mailchimp(e)) })
-                            .boxed();
-                    }
-                    match response.error_for_status() {
-                        Ok(result) => result
-                            .bytes()
-                            .map_err(error::Error::from)
-                            .and_then(|bytes| async move {
-                                if bytes.is_empty() {
-                                    serde_json::from_str("null").map_err(error::Error::from)
-                                } else {
-                                    // println!("{}", String::from_utf8_lossy(&bytes));
-                                    serde_json::from_slice(&bytes).map_err(error::Error::from)
-                                }
-                            })
-                            .boxed(),
-                        // Ok(result) => result.json().map_err(error::Error::from).boxed(),
-                        Err(e) => future::err(error::Error::from(e)).boxed(),
-                    }
-                })
-                .boxed(),
+            Ok(builder) => self.send(builder.json(json), |response| {
+                let status = response.status();
+                if status.is_client_error() {
+                    return response
+                        .json::<error::MailchimError>()
+                        .map_err(error::Error::from)
+                        .and_then(|e| async move { Err(Error::mailchimp(e)) })
+                        .boxed();
+                }
+                match response.error_for_status() {
+                    Ok(result) => result
+                        .bytes()
+                        .map_err(error::Error::from)
+                        .and_then(|bytes| async move {
+                            if bytes.is_empty() {
+                                serde_json::from_str("null").map_err(error::Error::from)
+                            } else {
+                                // println!("{}", String::from_utf8_lossy(&bytes));
+                                serde_json::from_slice(&bytes).map_err(error::Error::from)
+                            }
+                        })
+                        .boxed(),
+                    // Ok(result) => result.json().map_err(error::Error::from).boxed(),
+                    Err(e) => future::err(error::Error::from(e)).boxed(),
+                }
+            }),
             Err(e) => future::err(e).boxed(),
         }
     }
@@ -316,14 +338,10 @@ impl Client {
 
     pub fn delete(&self, path: &str) -> Future<()> {
         match self.request(Method::DELETE, path) {
-            Ok(builder) => builder
-                .send()
-                .map_err(error::Error::from)
-                .and_then(|response| match response.error_for_status() {
-                    Ok(_) => future::ok(()).boxed(),
-                    Err(e) => future::err(error::Error::from(e)).boxed(),
-                })
-                .boxed(),
+            Ok(builder) => self.send(builder, |response| match response.error_for_status() {
+                Ok(response) => response.bytes().map_ok(drop).map_err(Error::from).boxed(),
+                Err(e) => future::err(error::Error::from(e)).boxed(),
+            }),
             Err(e) => future::err(e).boxed(),
         }
     }
@@ -565,5 +583,115 @@ impl serde::de::Visitor<'_> for I32Visitor {
         E: serde::de::Error,
     {
         Ok(value as i32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    #[derive(Default)]
+    struct InFlight {
+        now: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    /// Answer every request with headers at once and a `{}` body after
+    /// `delay`, recording the most requests held open at once.
+    async fn serve(delay: Duration) -> (Client, Arc<InFlight>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let endpoint = Url::parse(&format!("http://{addr}")).expect("parse endpoint");
+        let in_flight = Arc::new(InFlight::default());
+        let counts = in_flight.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let counts = counts.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = socket.read(&mut buf).await.expect("read request");
+                        if n == 0 {
+                            return;
+                        }
+                        head.extend_from_slice(&buf[..n]);
+                    }
+                    // Drain a request body so closing the socket cannot reset
+                    // the connection before the response is read.
+                    let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                    let length: usize = text
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map_or(0, |n| n.trim().parse().expect("parse content-length"));
+                    let body_start = text.find("\r\n\r\n").expect("end of head") + 4;
+                    let mut remaining = length.saturating_sub(head.len() - body_start);
+                    while remaining > 0 {
+                        let n = socket.read(&mut buf).await.expect("read body");
+                        remaining = remaining.saturating_sub(n);
+                    }
+                    let now = counts.now.fetch_add(1, Ordering::SeqCst) + 1;
+                    counts.peak.fetch_max(now, Ordering::SeqCst);
+                    // The body follows the headers after `delay`, so the
+                    // request stays open while its response is being read.
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .expect("write headers");
+                    tokio::time::sleep(delay).await;
+                    counts.now.fetch_sub(1, Ordering::SeqCst);
+                    socket.write_all(b"{}").await.expect("write body");
+                });
+            }
+        });
+        let auth = AuthMode::Basic(BasicAuth {
+            auth_header: HeaderValue::from_static("Basic test"),
+            endpoint,
+        });
+        (Client::new_with_timeout(auth, 1), in_flight)
+    }
+
+    /// Send `n` requests at once from clones of `client`, cycling through
+    /// GET, POST and DELETE so every request path is under the cap.
+    fn request_many(client: &Client, n: usize) -> impl StdFuture<Output = Vec<Result<()>>> {
+        future::join_all((0..n).map(|i| {
+            let client = client.clone();
+            async move {
+                let path = "/3.0/ping";
+                match i % 3 {
+                    0 => client.fetch::<Value, _>(path, NO_QUERY).await.map(drop),
+                    1 => client.post::<_, Value>(path, &()).await.map(drop),
+                    _ => client.delete(path).await,
+                }
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn clones_of_a_client_share_a_cap_of_eight_requests() {
+        let (client, in_flight) = serve(Duration::from_millis(100)).await;
+        let results = request_many(&client, 20).await;
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert_eq!(in_flight.peak.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_connection_does_not_count_against_the_timeout() {
+        // Two waves of 700ms each: the second wave finishes 1.4s after it was
+        // queued, past the 1s timeout, and only its own 700ms may count.
+        let (client, _) = serve(Duration::from_millis(700)).await;
+        let results = request_many(&client, 16).await;
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
     }
 }
