@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use futures::{
     Future as StdFuture, FutureExt, Stream as StdStream, StreamExt, TryFutureExt, stream,
 };
@@ -5,10 +6,7 @@ use reqwest::{
     Method, RequestBuilder, StatusCode, Url,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
 };
-use serde::{
-    Serialize,
-    de::{DeserializeOwned, IgnoredAny},
-};
+use serde::{Serialize, de::DeserializeOwned};
 use std::{fmt::Debug, pin::Pin, str::FromStr, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use tokio_retry2::strategy::jitter;
@@ -179,14 +177,11 @@ impl Client {
     }
 
     /// Send a request once one of the client's connections is free, and hold
-    /// the connection until the response is decoded. reqwest starts its
+    /// the connection until the response body has been read. reqwest starts its
     /// timeout at `send`, so waiting for a connection does not count against
     /// it. A 429 is returned only after `rate_limited_backoff`, with the
     /// connection released, so every caller's retry waits it out.
-    fn send<R>(&self, request: Result<RequestBuilder>) -> Future<R>
-    where
-        R: 'static + DeserializeOwned + Send,
-    {
+    fn send(&self, request: Result<RequestBuilder>) -> Future<Bytes> {
         let connections = self.connections.clone();
         let backoff = self.rate_limited_backoff;
         async move {
@@ -195,7 +190,7 @@ impl Client {
                 let _permit = connections.acquire().await?;
                 let response = request.send().await?;
                 let rate_limited = response.status() == StatusCode::TOO_MANY_REQUESTS;
-                (rate_limited, decode(response).await)
+                (rate_limited, read_body(response).await)
             };
             if rate_limited {
                 tokio::time::sleep(backoff).await;
@@ -222,6 +217,8 @@ impl Client {
         Q: Serialize + ?Sized,
     {
         self.send(self.request(Method::GET, path).map(|b| b.query(query)))
+            .map(|body| body.and_then(|bytes| parse(&bytes)))
+            .boxed()
     }
 
     pub fn fetch_stream<Q, R>(&self, path: &str, mut query: Q) -> Stream<R::Item>
@@ -266,6 +263,8 @@ impl Client {
         R: 'static + DeserializeOwned + std::marker::Send,
     {
         self.send(self.request(method, path).map(|b| b.json(json)))
+            .map(|body| body.and_then(|bytes| parse(&bytes)))
+            .boxed()
     }
 
     pub fn post<T, R>(&self, path: &str, json: &T) -> Future<R>
@@ -293,21 +292,24 @@ impl Client {
     }
 
     pub fn delete(&self, path: &str) -> Future<()> {
-        self.send::<IgnoredAny>(self.request(Method::DELETE, path))
+        self.send(self.request(Method::DELETE, path))
             .map_ok(drop)
             .boxed()
     }
 }
 
-/// Read a response as `R`. A 4xx carries MailChimp's problem document, any
-/// other failure status is a request error, and an empty success body (a
-/// DELETE's 204) reads as JSON `null`.
-async fn decode<R: DeserializeOwned>(response: reqwest::Response) -> Result<R> {
+/// Read a response's body. A 4xx carries MailChimp's problem document, and
+/// any other failure status is a request error.
+async fn read_body(response: reqwest::Response) -> Result<Bytes> {
     if response.status().is_client_error() {
         return Err(Error::mailchimp(response.json().await?));
     }
-    let bytes = response.error_for_status()?.bytes().await?;
-    let json: &[u8] = if bytes.is_empty() { b"null" } else { &bytes };
+    Ok(response.error_for_status()?.bytes().await?)
+}
+
+/// Parse a success body as `R`, reading an empty body as JSON `null`.
+fn parse<R: DeserializeOwned>(bytes: &[u8]) -> Result<R> {
+    let json = if bytes.is_empty() { b"null" } else { bytes };
     Ok(serde_json::from_slice(json)?)
 }
 
@@ -696,6 +698,19 @@ mod tests {
             let results = request_many(&client, 3).await;
             assert!(results.iter().all(expected), "{}: {results:?}", reply.0);
         }
+    }
+
+    #[tokio::test]
+    async fn only_a_delete_ignores_its_success_body() {
+        let (client, _) = serve(Duration::ZERO, ("200 OK", "<html>done</html>")).await;
+        let results = request_many(&client, 3).await;
+        assert!(
+            matches!(
+                results.as_slice(),
+                [Err(Error::Json(_)), Err(Error::Json(_)), Ok(())]
+            ),
+            "{results:?}"
+        );
     }
 
     #[tokio::test]
