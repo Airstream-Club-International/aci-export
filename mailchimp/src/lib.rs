@@ -2,7 +2,7 @@ use futures::{
     Future as StdFuture, FutureExt, Stream as StdStream, StreamExt, TryFutureExt, future, stream,
 };
 use reqwest::{
-    Method, RequestBuilder, Url,
+    Method, RequestBuilder, StatusCode, Url,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -36,6 +36,9 @@ pub const DEFAULT_TIMEOUT: u64 = 120;
 /// connections beyond 10 with a 429; the margin leaves room for anything
 /// else using the account.
 const MAX_CONNECTIONS: usize = 8;
+/// How long a client waits after a 429 before reporting it, so a retry does
+/// not arrive while whatever holds the account's connections still does.
+const RATE_LIMITED_BACKOFF: Duration = Duration::from_secs(10);
 /// A utility constant to pass an empty query slice to the various client fetch
 /// functions
 pub const NO_QUERY: &[&str; 0] = &[""; 0];
@@ -135,6 +138,7 @@ pub struct Client {
     client: reqwest::Client,
     /// Shared by every clone, so one job's requests draw on one budget.
     connections: Arc<Semaphore>,
+    rate_limited_backoff: Duration,
 }
 
 pub mod client {
@@ -166,23 +170,33 @@ impl Client {
             auth,
             client,
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            rate_limited_backoff: RATE_LIMITED_BACKOFF,
         })
     }
 
     /// Send a request once one of the client's connections is free, and hold
     /// the connection until `read` has consumed the response. reqwest starts
     /// its timeout at `send`, so waiting for a connection does not count
-    /// against it.
+    /// against it. A 429 is returned only after `rate_limited_backoff`, with
+    /// the connection released, so every caller's retry waits it out.
     fn send<R, F>(&self, request: RequestBuilder, read: F) -> Future<R>
     where
         R: 'static + Send,
         F: FnOnce(reqwest::Response) -> Future<R> + Send + 'static,
     {
         let connections = self.connections.clone();
+        let backoff = self.rate_limited_backoff;
         async move {
-            let _permit = connections.acquire().await?;
-            let response = request.send().await?;
-            read(response).await
+            let (rate_limited, result) = {
+                let _permit = connections.acquire().await?;
+                let response = request.send().await?;
+                let rate_limited = response.status() == StatusCode::TOO_MANY_REQUESTS;
+                (rate_limited, read(response).await)
+            };
+            if rate_limited {
+                tokio::time::sleep(backoff).await;
+            }
+            result
         }
         .boxed()
     }
@@ -601,9 +615,18 @@ mod tests {
         peak: AtomicUsize,
     }
 
-    /// Answer every request with headers at once and a `{}` body after
+    const OK: (&str, &str) = ("200 OK", "{}");
+    const TOO_MANY: (&str, &str) = (
+        "429 Too Many Requests",
+        r#"{"status":429,"title":"Too Many Requests","detail":"","instance":""}"#,
+    );
+
+    /// Answer every request with `reply`'s headers at once and its body after
     /// `delay`, recording the most requests held open at once.
-    async fn serve(delay: Duration) -> (Client, Arc<InFlight>) {
+    async fn serve(
+        delay: Duration,
+        reply: (&'static str, &'static str),
+    ) -> (Client, Arc<InFlight>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback");
@@ -642,15 +665,18 @@ mod tests {
                     counts.peak.fetch_max(now, Ordering::SeqCst);
                     // The body follows the headers after `delay`, so the
                     // request stays open while its response is being read.
+                    let (status, body) = reply;
+                    let length = body.len();
+                    let headers = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                    );
                     socket
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n",
-                        )
+                        .write_all(headers.as_bytes())
                         .await
                         .expect("write headers");
                     tokio::time::sleep(delay).await;
                     counts.now.fetch_sub(1, Ordering::SeqCst);
-                    socket.write_all(b"{}").await.expect("write body");
+                    socket.write_all(body.as_bytes()).await.expect("write body");
                 });
             }
         });
@@ -682,7 +708,7 @@ mod tests {
 
     #[tokio::test]
     async fn clones_of_a_client_share_a_cap_of_eight_requests() {
-        let (client, in_flight) = serve(Duration::from_millis(100)).await;
+        let (client, in_flight) = serve(Duration::from_millis(100), OK).await;
         let results = request_many(&client, 20).await;
         assert!(results.iter().all(Result::is_ok), "{results:?}");
         assert_eq!(in_flight.peak.load(Ordering::SeqCst), 8);
@@ -692,8 +718,28 @@ mod tests {
     async fn waiting_for_a_connection_does_not_count_against_the_timeout() {
         // Two waves of 700ms each: the second wave finishes 1.4s after it was
         // queued, past the 1s timeout, and only its own 700ms may count.
-        let (client, _) = serve(Duration::from_millis(700)).await;
+        let (client, _) = serve(Duration::from_millis(700), OK).await;
         let results = request_many(&client, 16).await;
         assert!(results.iter().all(Result::is_ok), "{results:?}");
+    }
+
+    #[tokio::test]
+    async fn a_429_is_reported_after_the_backoff_with_its_connection_released() {
+        let (client, _) = serve(Duration::ZERO, TOO_MANY).await;
+        let client = Client {
+            rate_limited_backoff: Duration::from_millis(500),
+            ..client
+        };
+        // Nine requests against eight connections: each one waits the
+        // backoff, and the ninth only starts late if the eight waiting hold
+        // their connections through it.
+        let start = tokio::time::Instant::now();
+        let results = request_many(&client, 9).await;
+        let elapsed = start.elapsed();
+        assert!(results.iter().all(Result::is_err), "{results:?}");
+        assert!(
+            elapsed >= Duration::from_millis(500) && elapsed < Duration::from_millis(900),
+            "{elapsed:?}"
+        );
     }
 }

@@ -1,10 +1,5 @@
-use std::time::Duration;
 use thiserror::Error;
-use tokio_retry2::RetryError;
 pub type Result<T = ()> = std::result::Result<T, Error>;
-
-/// How long a request refused with a 429 waits before its next attempt.
-const RATE_LIMITED_BACKOFF: Duration = Duration::from_secs(10);
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -88,18 +83,12 @@ impl Error {
         }
     }
 
-    /// Convert this error into a RetryError based on whether it's retryable.
-    /// A 429 waits `RATE_LIMITED_BACKOFF` in place of the policy's delay: the
-    /// client stays under the connection limit on its own, so a 429 means
-    /// something else on the account holds connections, and that outlasts a
-    /// sub-second retry.
-    pub fn into_retry(self) -> RetryError<Self> {
-        match &self {
-            Self::Mailchimp(err) if err.status == 429 => {
-                RetryError::retry_after(self, RATE_LIMITED_BACKOFF)
-            }
-            _ if self.is_retryable() => RetryError::transient(self),
-            _ => RetryError::permanent(self),
+    /// Convert this error into a RetryError based on whether it's retryable
+    pub fn into_retry(self) -> tokio_retry2::RetryError<Self> {
+        if self.is_retryable() {
+            tokio_retry2::RetryError::transient(self)
+        } else {
+            tokio_retry2::RetryError::permanent(self)
         }
     }
 }
@@ -126,23 +115,5 @@ mod tests {
         for status in [429, 500, 503] {
             assert!(mailchimp(status).is_retryable(), "{status}");
         }
-    }
-
-    #[test]
-    fn a_429_waits_seconds_and_other_retries_keep_the_policy_delay() {
-        match mailchimp(429).into_retry() {
-            RetryError::Transient { retry_after, .. } => {
-                assert_eq!(retry_after, Some(Duration::from_secs(10)));
-            }
-            other => panic!("429 should retry: {other:?}"),
-        }
-        match mailchimp(500).into_retry() {
-            RetryError::Transient { retry_after, .. } => assert_eq!(retry_after, None),
-            other => panic!("500 should retry: {other:?}"),
-        }
-        assert!(matches!(
-            mailchimp(404).into_retry(),
-            RetryError::Permanent(_)
-        ));
     }
 }
