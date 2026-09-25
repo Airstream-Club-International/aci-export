@@ -1,12 +1,14 @@
+use bytes::Bytes;
 use futures::{
-    Future as StdFuture, FutureExt, Stream as StdStream, StreamExt, TryFutureExt, future, stream,
+    Future as StdFuture, FutureExt, Stream as StdStream, StreamExt, TryFutureExt, stream,
 };
 use reqwest::{
-    Method, RequestBuilder, Url,
+    Method, RequestBuilder, StatusCode, Url,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
 };
 use serde::{Serialize, de::DeserializeOwned};
-use std::{fmt::Debug, pin::Pin, str::FromStr, time::Duration};
+use std::{fmt::Debug, pin::Pin, str::FromStr, sync::Arc, time::Duration};
+use tokio::sync::Semaphore;
 use tokio_retry2::strategy::jitter;
 
 /// A type alias for `Future` that may return `crate::error::Error`
@@ -26,8 +28,19 @@ pub mod merge_fields;
 
 pub use error::{Error, Result};
 
-/// The default timeout for API requests
-pub const DEFAULT_TIMEOUT: u64 = 20;
+/// The default timeout for API requests, in seconds. MailChimp gives up on a
+/// call at 120 seconds; giving up sooner leaves it still working on a
+/// request we have stopped counting, holding one of the account's
+/// connections.
+pub const DEFAULT_TIMEOUT: u64 = 120;
+/// Requests a client has in flight at once. MailChimp refuses an account's
+/// connections beyond 10 with a 429; the margin leaves room for anything
+/// else using the account. The library's concurrent loops fan out this
+/// wide too, since any wider only queues behind the cap.
+pub(crate) const MAX_CONNECTIONS: usize = 8;
+/// How long a client waits after a 429 before reporting it, so a retry does
+/// not arrive while whatever holds the account's connections still does.
+const RATE_LIMITED_BACKOFF: Duration = Duration::from_secs(10);
 /// A utility constant to pass an empty query slice to the various client fetch
 /// functions
 pub const NO_QUERY: &[&str; 0] = &[""; 0];
@@ -125,6 +138,9 @@ where
 pub struct Client {
     auth: AuthMode,
     client: reqwest::Client,
+    /// Shared by every clone, so one job's requests draw on one budget.
+    connections: Arc<Semaphore>,
+    rate_limited_backoff: Duration,
 }
 
 pub mod client {
@@ -132,7 +148,7 @@ pub mod client {
 
     pub fn from_api_key(key: &str) -> Result<crate::Client> {
         let auth = crate::AuthMode::new_basic_auth(key)?;
-        Ok(crate::Client::new(auth))
+        crate::Client::new(auth)
     }
 }
 
@@ -140,20 +156,48 @@ impl Client {
     /// Create a new client using a given base URL and a default
     /// timeout. The library will use absoluate paths based on this
     /// base_url.
-    pub fn new(auth: AuthMode) -> Self {
+    pub fn new(auth: AuthMode) -> Result<Self> {
         Self::new_with_timeout(auth, DEFAULT_TIMEOUT)
     }
 
     /// Create a new client using a given base URL, and request
     /// timeout value.  The library will use absoluate paths based on
     /// the given base_url.
-    pub fn new_with_timeout(auth: AuthMode, timeout: u64) -> Self {
+    pub fn new_with_timeout(auth: AuthMode, timeout: u64) -> Result<Self> {
         let client = reqwest::Client::builder()
             .gzip(true)
             .timeout(Duration::from_secs(timeout))
-            .build()
-            .unwrap();
-        Self { auth, client }
+            .build()?;
+        Ok(Self {
+            auth,
+            client,
+            connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            rate_limited_backoff: RATE_LIMITED_BACKOFF,
+        })
+    }
+
+    /// Send a request once one of the client's connections is free, and hold
+    /// the connection until the response body has been read. reqwest starts its
+    /// timeout at `send`, so waiting for a connection does not count against
+    /// it. A 429 is returned only after `rate_limited_backoff`, with the
+    /// connection released, so every caller's retry waits it out.
+    fn send(&self, request: Result<RequestBuilder>) -> Future<Bytes> {
+        let connections = self.connections.clone();
+        let backoff = self.rate_limited_backoff;
+        async move {
+            let request = request?;
+            let (rate_limited, result) = {
+                let _permit = connections.acquire().await?;
+                let response = request.send().await?;
+                let rate_limited = response.status() == StatusCode::TOO_MANY_REQUESTS;
+                (rate_limited, read_body(response).await)
+            };
+            if rate_limited {
+                tokio::time::sleep(backoff).await;
+            }
+            result
+        }
+        .boxed()
     }
 
     fn request(&self, method: Method, path: &str) -> Result<RequestBuilder> {
@@ -172,45 +216,10 @@ impl Client {
         T: 'static + DeserializeOwned + Send,
         Q: Serialize + ?Sized,
     {
-        match self.request(Method::GET, path) {
-            Ok(builder) => builder
-                .query(query)
-                .send()
-                .map_err(Error::from)
-                .and_then(|response| {
-                    let status = response.status();
-                    if status.is_client_error() {
-                        return response
-                            .json::<error::MailchimError>()
-                            .map_err(error::Error::from)
-                            .and_then(|e| async move { Err(Error::mailchimp(e)) })
-                            .boxed();
-                    }
-                    match response.error_for_status() {
-                        Ok(result) => result
-                            .bytes()
-                            .map_err(Error::from)
-                            .and_then(|bytes| async move {
-                                // println!("{}", String::from_utf8_lossy(&bytes));
-                                serde_json::from_slice(&bytes).map_err(error::Error::from)
-                            })
-                            .boxed(),
-                        Err(e) => future::err(error::Error::from(e)).boxed(),
-                    }
-                })
-                .boxed(),
-            Err(e) => future::err(e).boxed(),
-        }
+        self.send(self.request(Method::GET, path).map(|b| b.query(query)))
+            .map(|body| body.and_then(|bytes| parse(&bytes)))
+            .boxed()
     }
-
-    // pub async fn fetch_all<Q, R>(&self, path: &str, mut query: Q) -> Result<Vec<R::Item>>
-    // where
-    //     R: PagedResponse + 'static,
-    //     Q: PagedQuery + 'static + Serialize,
-    // {
-    //     let client = self.clone();
-    //     let path = path.to_string();
-    // }
 
     pub fn fetch_stream<Q, R>(&self, path: &str, mut query: Q) -> Stream<R::Item>
     where
@@ -222,7 +231,6 @@ impl Client {
 
         self.fetch::<R, _>(&path, &query)
             .map_ok(move |data| {
-                // let mut query = query.clone();
                 query.inc_offset(data.len());
                 stream::try_unfold(
                     (data, client, path, query),
@@ -254,40 +262,9 @@ impl Client {
         T: Serialize + ?Sized,
         R: 'static + DeserializeOwned + std::marker::Send,
     {
-        match self.request(method, path) {
-            Ok(builder) => builder
-                .json(json)
-                .send()
-                .map_err(error::Error::from)
-                .and_then(|response| {
-                    let status = response.status();
-                    if status.is_client_error() {
-                        return response
-                            .json::<error::MailchimError>()
-                            .map_err(error::Error::from)
-                            .and_then(|e| async move { Err(Error::mailchimp(e)) })
-                            .boxed();
-                    }
-                    match response.error_for_status() {
-                        Ok(result) => result
-                            .bytes()
-                            .map_err(error::Error::from)
-                            .and_then(|bytes| async move {
-                                if bytes.is_empty() {
-                                    serde_json::from_str("null").map_err(error::Error::from)
-                                } else {
-                                    // println!("{}", String::from_utf8_lossy(&bytes));
-                                    serde_json::from_slice(&bytes).map_err(error::Error::from)
-                                }
-                            })
-                            .boxed(),
-                        // Ok(result) => result.json().map_err(error::Error::from).boxed(),
-                        Err(e) => future::err(error::Error::from(e)).boxed(),
-                    }
-                })
-                .boxed(),
-            Err(e) => future::err(e).boxed(),
-        }
+        self.send(self.request(method, path).map(|b| b.json(json)))
+            .map(|body| body.and_then(|bytes| parse(&bytes)))
+            .boxed()
     }
 
     pub fn post<T, R>(&self, path: &str, json: &T) -> Future<R>
@@ -315,18 +292,25 @@ impl Client {
     }
 
     pub fn delete(&self, path: &str) -> Future<()> {
-        match self.request(Method::DELETE, path) {
-            Ok(builder) => builder
-                .send()
-                .map_err(error::Error::from)
-                .and_then(|response| match response.error_for_status() {
-                    Ok(_) => future::ok(()).boxed(),
-                    Err(e) => future::err(error::Error::from(e)).boxed(),
-                })
-                .boxed(),
-            Err(e) => future::err(e).boxed(),
-        }
+        self.send(self.request(Method::DELETE, path))
+            .map_ok(drop)
+            .boxed()
     }
+}
+
+/// Read a response's body. A 4xx carries MailChimp's problem document, and
+/// any other failure status is a request error.
+async fn read_body(response: reqwest::Response) -> Result<Bytes> {
+    if response.status().is_client_error() {
+        return Err(Error::mailchimp(response.json().await?));
+    }
+    Ok(response.error_for_status()?.bytes().await?)
+}
+
+/// Parse a success body as `R`, reading an empty body as JSON `null`.
+fn parse<R: DeserializeOwned>(bytes: &[u8]) -> Result<R> {
+    let json = if bytes.is_empty() { b"null" } else { bytes };
+    Ok(serde_json::from_slice(json)?)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -565,5 +549,187 @@ impl serde::de::Visitor<'_> for I32Visitor {
         E: serde::de::Error,
     {
         Ok(value as i32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::future;
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    #[derive(Default)]
+    struct InFlight {
+        now: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    const OK: (&str, &str) = ("200 OK", "{}");
+    const TOO_MANY: (&str, &str) = (
+        "429 Too Many Requests",
+        r#"{"status":429,"title":"Too Many Requests","detail":"","instance":""}"#,
+    );
+
+    /// Answer every request with `reply`'s headers at once and its body after
+    /// `delay`, recording the most requests held open at once.
+    async fn serve(
+        delay: Duration,
+        reply: (&'static str, &'static str),
+    ) -> (Client, Arc<InFlight>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let endpoint = Url::parse(&format!("http://{addr}")).expect("parse endpoint");
+        let in_flight = Arc::new(InFlight::default());
+        let counts = in_flight.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let counts = counts.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = socket.read(&mut buf).await.expect("read request");
+                        if n == 0 {
+                            return;
+                        }
+                        head.extend_from_slice(&buf[..n]);
+                    }
+                    // Drain a request body so closing the socket cannot reset
+                    // the connection before the response is read.
+                    let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                    let length: usize = text
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map_or(0, |n| n.trim().parse().expect("parse content-length"));
+                    let body_start = text.find("\r\n\r\n").expect("end of head") + 4;
+                    let mut remaining = length.saturating_sub(head.len() - body_start);
+                    while remaining > 0 {
+                        let n = socket.read(&mut buf).await.expect("read body");
+                        remaining = remaining.saturating_sub(n);
+                    }
+                    let now = counts.now.fetch_add(1, Ordering::SeqCst) + 1;
+                    counts.peak.fetch_max(now, Ordering::SeqCst);
+                    // The body follows the headers after `delay`, so the
+                    // request stays open while its response is being read.
+                    let (status, body) = reply;
+                    let length = body.len();
+                    let headers = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                    );
+                    socket
+                        .write_all(headers.as_bytes())
+                        .await
+                        .expect("write headers");
+                    tokio::time::sleep(delay).await;
+                    counts.now.fetch_sub(1, Ordering::SeqCst);
+                    socket.write_all(body.as_bytes()).await.expect("write body");
+                });
+            }
+        });
+        let auth = AuthMode::Basic(BasicAuth {
+            auth_header: HeaderValue::from_static("Basic test"),
+            endpoint,
+        });
+        (
+            Client::new_with_timeout(auth, 1).expect("build client"),
+            in_flight,
+        )
+    }
+
+    /// Send `n` requests at once from clones of `client`, cycling through
+    /// GET, POST and DELETE so every request path is under the cap.
+    fn request_many(client: &Client, n: usize) -> impl StdFuture<Output = Vec<Result<()>>> {
+        future::join_all((0..n).map(|i| {
+            let client = client.clone();
+            async move {
+                let path = "/3.0/ping";
+                match i % 3 {
+                    0 => client.fetch::<Value, _>(path, NO_QUERY).await.map(drop),
+                    1 => client.post::<_, Value>(path, &()).await.map(drop),
+                    _ => client.delete(path).await,
+                }
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn clones_of_a_client_share_a_cap_of_eight_requests() {
+        let (client, in_flight) = serve(Duration::from_millis(100), OK).await;
+        let results = request_many(&client, 20).await;
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert_eq!(in_flight.peak.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_connection_does_not_count_against_the_timeout() {
+        // Two waves of 700ms each: the second wave finishes 1.4s after it was
+        // queued, past the 1s timeout, and only its own 700ms may count.
+        let (client, _) = serve(Duration::from_millis(700), OK).await;
+        let results = request_many(&client, 16).await;
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+    }
+
+    #[tokio::test]
+    async fn every_method_reads_a_status_the_same_way() {
+        let cases: [((&'static str, &'static str), fn(&Result<()>) -> bool); 3] = [
+            (
+                (
+                    "404 Not Found",
+                    r#"{"status":404,"title":"Resource Not Found","detail":"","instance":""}"#,
+                ),
+                |r| matches!(r, Err(Error::Mailchimp(err)) if err.status == 404),
+            ),
+            (("500 Internal Server Error", ""), |r| {
+                matches!(r, Err(Error::Request(_)))
+            }),
+            (("204 No Content", ""), Result::is_ok),
+        ];
+        for (reply, expected) in cases {
+            let (client, _) = serve(Duration::ZERO, reply).await;
+            // One each of GET, POST and DELETE.
+            let results = request_many(&client, 3).await;
+            assert!(results.iter().all(expected), "{}: {results:?}", reply.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_delete_ignores_its_success_body() {
+        let (client, _) = serve(Duration::ZERO, ("200 OK", "<html>done</html>")).await;
+        let results = request_many(&client, 3).await;
+        assert!(
+            matches!(
+                results.as_slice(),
+                [Err(Error::Json(_)), Err(Error::Json(_)), Ok(())]
+            ),
+            "{results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_is_reported_after_the_backoff_with_its_connection_released() {
+        let (client, _) = serve(Duration::ZERO, TOO_MANY).await;
+        let client = Client {
+            rate_limited_backoff: Duration::from_millis(500),
+            ..client
+        };
+        // Nine requests against eight connections: each one waits the
+        // backoff, and the ninth only starts late if the eight waiting hold
+        // their connections through it.
+        let start = tokio::time::Instant::now();
+        let results = request_many(&client, 9).await;
+        let elapsed = start.elapsed();
+        assert!(results.iter().all(Result::is_err), "{results:?}");
+        assert!(
+            elapsed >= Duration::from_millis(500) && elapsed < Duration::from_millis(900),
+            "{elapsed:?}"
+        );
     }
 }

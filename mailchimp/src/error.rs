@@ -9,6 +9,8 @@ pub enum Error {
     MalformedUrl(#[from] url::ParseError),
     #[error("request error: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("client connections closed")]
+    Connections(#[from] tokio::sync::AcquireError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("mailchimp error {}: {}", .0.status, .0.detail)]

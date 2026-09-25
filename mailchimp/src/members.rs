@@ -1,6 +1,6 @@
 use crate::{
-    Client, Error, NO_QUERY, Result, RetryPolicy, Stream, batches, deserialize_null_string,
-    paged_query_impl, paged_response_impl, query_default_impl,
+    Client, Error, MAX_CONNECTIONS, NO_QUERY, Result, RetryPolicy, Stream, batches,
+    deserialize_null_string, paged_query_impl, paged_response_impl, query_default_impl,
 };
 use futures::{
     TryFutureExt,
@@ -79,7 +79,7 @@ pub async fn all_collect(
                     .await
             }
         })
-        .buffered(10)
+        .buffered(MAX_CONNECTIONS)
         .try_collect()
         .await?;
     all_members.extend(remaining.into_iter().flatten());
@@ -185,7 +185,7 @@ pub async fn retain(
 
     futures::stream::iter(to_archive.iter())
         .map(|member_id| Ok::<_, crate::Error>((client.clone(), member_id)))
-        .try_for_each_concurrent(10, |(client, member_id)| async move {
+        .try_for_each_concurrent(MAX_CONNECTIONS, |(client, member_id)| async move {
             delete(&client, list_id, member_id)
                 .await
                 .inspect_err(|err| tracing::error!(id = member_id, ?err, "failed to archive"))?;
@@ -343,7 +343,7 @@ pub async fn rename_many(
     let outcome = Arc::new(RwLock::new(Renamed::default()));
     stream::iter(renames)
         .map(Ok::<_, Error>)
-        .try_for_each_concurrent(10, |rename| {
+        .try_for_each_concurrent(MAX_CONNECTIONS, |rename| {
             let client = client.clone();
             let outcome = outcome.clone();
             async move {
@@ -427,7 +427,7 @@ pub async fn upsert_many(
         .chunks(MEMBER_BATCH_UPSERT_MAX)
         .map(Ok::<Vec<_>, Error>)
         .map_ok(|members| (client.clone(), members, upserted.clone(), retries))
-        .try_for_each_concurrent(8, |(client, members, processed, retries)| async move {
+        .try_for_each_concurrent(MAX_CONNECTIONS, |(client, members, processed, retries)| async move {
             let response = Retry::spawn_notify(
                 retries,
                 || batch_upsert(&client, list_id, &members).map_err(Error::into_retry),
@@ -562,7 +562,7 @@ pub mod tags {
             tracing::debug!(count = tag_updates.len(), "updating tags directly");
             return stream::iter(tag_updates)
                 .map(Ok::<_, Error>)
-                .try_for_each_concurrent(10, |(member_id, updates)| {
+                .try_for_each_concurrent(MAX_CONNECTIONS, |(member_id, updates)| {
                     let client = client.clone();
                     async move {
                         Retry::spawn_notify(
@@ -583,7 +583,7 @@ pub mod tags {
             .chunks(1000)
             .map(Ok::<Vec<_>, Error>)
             .map_ok(|updates| (client.clone(), updates, retries))
-            .try_for_each_concurrent(10, |(client, updates, retries)| async move {
+            .try_for_each_concurrent(MAX_CONNECTIONS, |(client, updates, retries)| async move {
                 let mut batch = batches::Batch::default();
                 for (member_id, updates) in updates {
                     let operation = batch::update(&mut batch, list_id, member_id, updates)?;

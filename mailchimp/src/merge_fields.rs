@@ -4,6 +4,7 @@ use crate::{
 };
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 
 pub fn all(client: &Client, list_id: &str, query: MergeFieldsQuery) -> Stream<MergeField> {
@@ -72,9 +73,14 @@ pub async fn sync(
         .into_iter()
         .partition(|(key, _)| !target.contains_key(key));
 
-    let (to_add, target_remaining): (Vec<TaggedMergeField>, Vec<TaggedMergeField>) = target
-        .into_iter()
-        .partition(|(key, _)| !current.contains_key(key));
+    let mut to_add: Vec<TaggedMergeField> = vec![];
+    let mut to_compare = vec![];
+    for (key, field) in target {
+        match current.get(&key) {
+            Some(existing) => to_compare.push((existing, field)),
+            None => to_add.push((key, field)),
+        }
+    }
 
     let deleted = collect_tags(&to_delete);
     if process_deletes {
@@ -89,8 +95,7 @@ pub async fn sync(
     }
 
     let mut updated = vec![];
-    for (_, mut field) in target_remaining.into_iter() {
-        let current = current.get(&field.tag).unwrap();
+    for (current, mut field) in to_compare {
         field.merge_id = current.merge_id;
         if field != *current {
             updated.push(field.tag.clone());
@@ -276,7 +281,7 @@ impl From<HashMap<String, MergeField>> for MergeFields {
     }
 }
 
-pub type MergeFieldValue = (String, serde_json::Value);
+pub type MergeFieldValue = (String, Value);
 
 impl MergeFields {
     pub fn to_value<F>(&self, tag: &str, value: F) -> Result<Option<MergeFieldValue>>
@@ -315,14 +320,8 @@ impl ToMergeFieldValue for chrono::NaiveDate {
 impl ToMergeFieldValue for u64 {
     fn to_merge_field_value(self, field: &MergeField) -> Result<Option<MergeFieldValue>> {
         match field.r#type {
-            MergeType::Number => Ok(Some((
-                field.tag.clone(),
-                serde_json::to_value(self).unwrap(),
-            ))),
-            MergeType::Text => Ok(Some((
-                field.tag.clone(),
-                serde_json::to_value(self.to_string()).unwrap(),
-            ))),
+            MergeType::Number => Ok(Some((field.tag.clone(), Value::from(self)))),
+            MergeType::Text => Ok(Some((field.tag.clone(), Value::from(self.to_string())))),
             _ => Err(Error::InvalidMergeType(field.r#type.to_string())),
         }
     }
@@ -331,14 +330,8 @@ impl ToMergeFieldValue for u64 {
 impl ToMergeFieldValue for i64 {
     fn to_merge_field_value(self, field: &MergeField) -> Result<Option<MergeFieldValue>> {
         match field.r#type {
-            MergeType::Number => Ok(Some((
-                field.tag.clone(),
-                serde_json::to_value(self).unwrap(),
-            ))),
-            MergeType::Text => Ok(Some((
-                field.tag.clone(),
-                serde_json::to_value(self.to_string()).unwrap(),
-            ))),
+            MergeType::Number => Ok(Some((field.tag.clone(), Value::from(self)))),
+            MergeType::Text => Ok(Some((field.tag.clone(), Value::from(self.to_string())))),
             _ => Err(Error::InvalidMergeType(field.r#type.to_string())),
         }
     }

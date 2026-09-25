@@ -2,7 +2,10 @@
 //! MailChimp shows a category on the audience's hosted forms as soon as it
 //! exists, so creating one is a member-visible change.
 
-use crate::{Client, Error, Result, RetryPolicy, batches, deserialize_null_string, read_config};
+use crate::{
+    Client, Error, MAX_CONNECTIONS, Result, RetryPolicy, batches, deserialize_null_string,
+    read_config,
+};
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -504,7 +507,7 @@ pub async fn update_many(
     futures::stream::iter(member_ids)
         .chunks(1000)
         .map(Ok::<Vec<_>, Error>)
-        .try_for_each_concurrent(10, |member_ids| {
+        .try_for_each_concurrent(MAX_CONNECTIONS, |member_ids| {
             let client = client.clone();
             let body = &body;
             async move {
