@@ -9,13 +9,18 @@ use futures::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    error::Error as StdError,
     sync::Arc,
 };
 use tokio::sync::RwLock;
 use tokio_retry2::Retry;
 
 fn log_batch_member_retry(err: &Error, sleep: std::time::Duration) {
-    tracing::warn!(%err, sleep = sleep.as_secs(), "batch member update");
+    tracing::warn!(
+        err = err as &dyn StdError,
+        sleep = sleep.as_secs(),
+        "batch member update"
+    );
 }
 
 /// MailChimp returns a per-member error when a contact is locked out of
@@ -29,11 +34,19 @@ fn is_compliance_error(err: &MemberBatchUpsertError) -> bool {
 }
 
 fn log_batch_tag_retry(err: &Error, sleep: std::time::Duration) {
-    tracing::warn!(%err, sleep = sleep.as_secs(), "batch tag update");
+    tracing::warn!(
+        err = err as &dyn StdError,
+        sleep = sleep.as_secs(),
+        "batch tag update"
+    );
 }
 
 fn log_tag_retry(err: &Error, sleep: std::time::Duration) {
-    tracing::warn!(%err, sleep = sleep.as_secs(), "tag update");
+    tracing::warn!(
+        err = err as &dyn StdError,
+        sleep = sleep.as_secs(),
+        "tag update"
+    );
 }
 
 pub fn all(client: &Client, list_id: &str, query: MembersQuery) -> Stream<Member> {
@@ -311,7 +324,11 @@ pub fn email_renames(audience: &[Member], targets: &[Member]) -> Vec<EmailRename
 }
 
 fn log_rename_retry(err: &Error, sleep: std::time::Duration) {
-    tracing::warn!(%err, sleep = sleep.as_secs(), "member rename");
+    tracing::warn!(
+        err = err as &dyn StdError,
+        sleep = sleep.as_secs(),
+        "member rename"
+    );
 }
 
 /// Outcome of [`rename_many`]: the renames that landed and the ones
@@ -373,7 +390,7 @@ pub async fn rename_many(
                                 id = rename.id,
                                 from = rename.from,
                                 to = rename.to,
-                                %err,
+                                err = &err as &dyn StdError,
                                 "member rename failed"
                             );
                         }
