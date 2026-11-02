@@ -569,18 +569,18 @@ mod tests {
         peak: AtomicUsize,
     }
 
-    const OK: (&str, &str) = ("200 OK", "{}");
-    const TOO_MANY: (&str, &str) = (
+    /// A canned response: the status line and the body.
+    type Reply = (&'static str, &'static str);
+
+    const OK: Reply = ("200 OK", "{}");
+    const TOO_MANY: Reply = (
         "429 Too Many Requests",
         r#"{"status":429,"title":"Too Many Requests","detail":"","instance":""}"#,
     );
 
     /// Answer every request with `reply`'s headers at once and its body after
     /// `delay`, recording the most requests held open at once.
-    async fn serve(
-        delay: Duration,
-        reply: (&'static str, &'static str),
-    ) -> (Client, Arc<InFlight>) {
+    async fn serve(delay: Duration, reply: Reply) -> (Client, Arc<InFlight>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback");
@@ -679,7 +679,8 @@ mod tests {
 
     #[tokio::test]
     async fn every_method_reads_a_status_the_same_way() {
-        let cases: [((&'static str, &'static str), fn(&Result<()>) -> bool); 3] = [
+        type Check = fn(&Result<()>) -> bool;
+        let cases: [(Reply, Check); 3] = [
             (
                 (
                     "404 Not Found",
