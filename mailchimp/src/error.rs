@@ -13,8 +13,8 @@ pub enum Error {
     Connections(#[from] tokio::sync::AcquireError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("mailchimp error {}: {}", .0.status, .0.detail)]
-    Mailchimp(MailchimError),
+    #[error("{0}")]
+    Mailchimp(Box<MailchimError>),
     #[error("unexpected value: {0}")]
     Value(serde_json::Value),
     #[error("unexpected or invalid number: {0}")]
@@ -44,6 +44,30 @@ pub struct MailchimError {
     pub title: String,
     pub detail: String,
     pub instance: String,
+    /// Per-field reasons MailChimp attaches to a 400 whose `detail` only
+    /// points at them ("see the 'errors' array"). Absent on most errors.
+    #[serde(default)]
+    pub errors: Vec<FieldError>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct FieldError {
+    #[serde(default)]
+    pub field: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for MailchimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { status, detail, .. } = self;
+        write!(f, "mailchimp error {status}: {detail}")?;
+        self.errors
+            .iter()
+            .try_for_each(|FieldError { field, message }| match field.as_str() {
+                "" => write!(f, " [{message}]"),
+                field => write!(f, " [{field}: {message}]"),
+            })
+    }
 }
 
 impl Error {
@@ -56,7 +80,7 @@ impl Error {
     }
 
     pub fn mailchimp(value: MailchimError) -> Self {
-        Self::Mailchimp(value)
+        Self::Mailchimp(Box::new(value))
     }
 
     pub fn merge_field<S: ToString>(msg: S) -> Self {
@@ -98,13 +122,44 @@ mod tests {
     use super::*;
 
     fn mailchimp(status: u16) -> Error {
-        Error::Mailchimp(MailchimError {
+        Error::mailchimp(MailchimError {
             status,
             r#type: None,
             title: String::new(),
             detail: String::new(),
             instance: String::new(),
+            errors: vec![],
         })
+    }
+
+    #[test]
+    fn a_validation_error_shows_each_field_reason() {
+        let body = r#"{
+            "type": "https://mailchimp.com/developer/marketing/docs/errors/",
+            "title": "Invalid Resource",
+            "status": 400,
+            "detail": "The resource submitted could not be validated. For field-specific details, see the 'errors' array.",
+            "instance": "2b5c8a3e-0000-0000-0000-000000000000",
+            "errors": [
+                {"field": "email_address", "message": "This email address is already a list member."},
+                {"field": "", "message": "Second reason."}
+            ]
+        }"#;
+        let err = Error::mailchimp(serde_json::from_str(body).expect("parse 400 body"));
+        assert_eq!(
+            err.to_string(),
+            "mailchimp error 400: The resource submitted could not be validated. \
+             For field-specific details, see the 'errors' array. \
+             [email_address: This email address is already a list member.] [Second reason.]"
+        );
+    }
+
+    #[test]
+    fn an_error_without_field_reasons_reads_as_before() {
+        let body =
+            r#"{"status":404,"title":"Resource Not Found","detail":"Not here.","instance":""}"#;
+        let err = Error::mailchimp(serde_json::from_str(body).expect("parse 404 body"));
+        assert_eq!(err.to_string(), "mailchimp error 404: Not here.");
     }
 
     #[test]
