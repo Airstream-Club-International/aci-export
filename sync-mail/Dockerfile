@@ -1,5 +1,5 @@
 # Chef stage - base image with cargo-chef installed
-FROM lukemathwalker/cargo-chef:latest-rust-1.92 AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1.98 AS chef
 WORKDIR /app
 
 # Planner stage - analyze dependencies and create recipe

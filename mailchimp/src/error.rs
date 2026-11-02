@@ -7,7 +7,7 @@ pub enum Error {
     MalformedAPIKey,
     #[error("malformed url")]
     MalformedUrl(#[from] url::ParseError),
-    #[error("request error: {0}")]
+    #[error("request error")]
     Request(#[from] reqwest::Error),
     #[error("client connections closed")]
     Connections(#[from] tokio::sync::AcquireError),
