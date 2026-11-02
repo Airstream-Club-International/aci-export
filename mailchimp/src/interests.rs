@@ -8,7 +8,7 @@ use crate::{
 };
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{collections::HashMap, error::Error as StdError};
 use tokio_retry2::Retry;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Default)]
@@ -487,7 +487,11 @@ pub fn already_held(targets: &[&ResolvedInterest]) -> Vec<String> {
 }
 
 fn log_batch_interest_retry(err: &Error, sleep: std::time::Duration) {
-    tracing::warn!(%err, sleep = sleep.as_secs(), "batch interest update");
+    tracing::warn!(
+        err = err as &dyn StdError,
+        sleep = sleep.as_secs(),
+        "batch interest update"
+    );
 }
 
 /// Set the given interests on every listed contact, in batches. Interests
