@@ -454,17 +454,55 @@ flags AS (
   GROUP BY a.uid
 ),
 
+home_acp AS (
+  /* Active home-club memberships of the scoped users, in any club: a member
+     in scope only through an affiliate club still has their home club as
+     local club. */
+  SELECT
+    p.parent_id AS uid,
+    p.id        AS paragraph_id,
+    pc.field_club_target_id AS club_nid,
+    fjd.field_join_date_value AS join_dt_raw
+  FROM user__field_home_club uhc
+  JOIN paragraphs_item_field_data p
+    ON p.id = uhc.field_home_club_target_id
+   AND p.parent_id = uhc.entity_id
+  JOIN paragraph__field_club pc
+    ON pc.entity_id = p.id
+   AND pc.deleted = '0'
+  LEFT JOIN paragraph__field_join_date fjd
+    ON fjd.entity_id = p.id AND fjd.deleted = '0'
+  LEFT JOIN paragraph__field_leave_date fld
+    ON fld.entity_id = p.id AND fld.deleted = '0'
+  WHERE uhc.deleted = '0'
+    AND uhc.entity_id IN (SELECT uid FROM acp)
+    AND p.status = '1'
+    AND p.type   = 'membership'
+    AND fjd.field_join_date_value IS NOT NULL
+    AND DATE(fjd.field_join_date_value) <= CURRENT_DATE
+    AND (fld.field_leave_date_value IS NULL OR DATE(fld.field_leave_date_value) >= CURRENT_DATE)
+),
+
 active_pick AS (
-  /* Each user's active memberships with the latest join date; RANK keeps
-     every membership tied on that date. The window function makes MariaDB
-     compute this CTE once instead of merging it into the outer query. */
+  /* One membership per user, supplying local club and membership class: the
+     active home club when there is one, else the latest scoped membership.
+     paragraph_id breaks ties so the pick is deterministic. The window
+     function makes MariaDB compute this CTE once instead of merging it into
+     the outer query. */
   SELECT uid, paragraph_id, club_nid
   FROM (
     SELECT uid, paragraph_id, club_nid,
-           RANK() OVER (PARTITION BY uid ORDER BY DATE(join_dt_raw) DESC) AS join_rank
-    FROM acp
+           ROW_NUMBER() OVER (
+             PARTITION BY uid
+             ORDER BY is_home DESC, DATE(join_dt_raw) DESC, paragraph_id DESC
+           ) AS pick_rank
+    FROM (
+      SELECT uid, paragraph_id, club_nid, join_dt_raw, 1 AS is_home FROM home_acp
+      UNION ALL
+      SELECT uid, paragraph_id, club_nid, join_dt_raw, 0 AS is_home FROM acp
+    ) candidates
   ) ranked
-  WHERE join_rank = 1
+  WHERE pick_rank = 1
 )
 
 SELECT
